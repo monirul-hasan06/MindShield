@@ -1,0 +1,9 @@
+customtkinter
+Pillow
+psutil
+pystray
+pywin32; platform_system == "Windows"
+pywinauto; platform_system == "Windows"
+PyInstaller
+pywinctl
+sqlcipher3-wheels==0.5.7

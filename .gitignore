@@ -1,0 +1,36 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments
+venv/
+.venv/
+env/
+
+# PyInstaller build output and release distributions
+/build/
+/dist/
+/installer_output/
+
+# Local databases, SQLCipher keys, and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.key.dpapi
+*.encrypted.tmp
+
+# Logs and local environment files
+*.log
+.env
+.env.*
+!.env.example
+
+# IDE and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
