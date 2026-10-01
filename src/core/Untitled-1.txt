@@ -1,0 +1,2 @@
+if exist "%ProgramFiles(x86)%\MindShield\unins000.exe" "%ProgramFiles(x86)%\MindShield\unins000.exe"
+reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{8A1F3E92-7E3B-4C81-9B54-1B112D95678A}_is1" /v UninstallString

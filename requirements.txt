@@ -6,4 +6,4 @@ pywin32; platform_system == "Windows"
 pywinauto; platform_system == "Windows"
 PyInstaller
 pywinctl
-sqlcipher3-wheels==0.5.7
+sqlcipher3-wheels==0.5.7; platform_system == "Windows"

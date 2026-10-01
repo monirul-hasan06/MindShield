@@ -7,6 +7,13 @@ import time
 import tkinter as tk
 
 import customtkinter as ctk
+from PIL import Image
+
+from src.core.app_icon import get_app_logo_path
+from src.gui.typography import (
+    FONT_FAMILY,
+    get_display_font_family,
+)
 
 
 class OverlayWindow(ctk.CTkToplevel):
@@ -52,10 +59,26 @@ class OverlayWindow(ctk.CTkToplevel):
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.place(relx=0.5, rely=0.5, anchor="center")
+        with Image.open(get_app_logo_path()) as logo_file:
+            logo = logo_file.convert("RGBA")
+        self._logo_image = ctk.CTkImage(
+            light_image=logo,
+            dark_image=logo,
+            size=logo.size,
+        )
+        ctk.CTkLabel(
+            content,
+            image=self._logo_image,
+            text="",
+        ).pack(pady=(0, 12))
         self.message_label = ctk.CTkLabel(
             content,
             text=self.MESSAGE,
-            font=ctk.CTkFont(size=20, weight="bold"),
+            font=ctk.CTkFont(
+                family=FONT_FAMILY,
+                size=20,
+                weight="bold",
+            ),
             text_color="#ffffff",
             wraplength=420,
         )
@@ -64,7 +87,11 @@ class OverlayWindow(ctk.CTkToplevel):
         self.countdown_label = ctk.CTkLabel(
             content,
             text="",
-            font=ctk.CTkFont(size=32, weight="bold"),
+            font=ctk.CTkFont(
+                family=get_display_font_family(),
+                size=32,
+                weight="bold",
+            ),
             text_color="#38bdf8",
         )
         self.countdown_label.pack(pady=(0, 24))

@@ -1,46 +1,43 @@
-"""SQLCipher-encrypted persistence for MindShield sessions and settings."""
+"""SQLite persistence for MindShield sessions, settings, and breaks."""
 
 from __future__ import annotations
 
+import filecmp
 import os
-import secrets
+import shutil
+import sqlite3
 import sys
+import tempfile
 from contextlib import closing
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
-import pywintypes
-import sqlcipher3.dbapi2 as sqlite3
-import win32crypt
-
 
 class DatabaseHandler:
-    """Create and access MindShield's per-user encrypted SQLCipher database."""
+    """Create and access MindShield's writable SQLite database."""
 
     def __init__(
         self,
         db_path: str | Path | None = None,
         key_path: str | Path | None = None,
     ) -> None:
+        self._custom_db_path = db_path is not None
         self.db_path = (
             Path(db_path)
             if db_path is not None
             else self._default_db_path()
         )
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.key_path = (
             Path(key_path)
             if key_path is not None
             else (
-                self._default_key_path()
-                if db_path is None
-                else self.db_path.with_suffix(".key.dpapi")
+                self.db_path.with_suffix(".key.dpapi")
+                if self._custom_db_path
+                else self._default_key_path()
             )
         )
-        self.key_path.parent.mkdir(parents=True, exist_ok=True)
-        self._encryption_key = self._load_encryption_key()
-        self._verify_sqlcipher()
-        self._encrypt_existing_database()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_standard_sqlite_database()
         self.init_db()
 
     @staticmethod
@@ -65,147 +62,192 @@ class DatabaseHandler:
         )
         return local_app_data / "MindShield" / "database.key.dpapi"
 
-    def _load_encryption_key(self) -> bytes:
-        if self.key_path.exists():
-            try:
-                key = win32crypt.CryptUnprotectData(
-                    self.key_path.read_bytes(),
-                    None,
-                    None,
-                    None,
-                    0,
-                )[1]
-            except pywintypes.error as error:
-                raise RuntimeError(
-                    f"Cannot decrypt the MindShield database key at {self.key_path}"
-                ) from error
-            if len(key) != 32:
-                raise ValueError("The protected MindShield database key is invalid")
-            return key
-
-        key = secrets.token_bytes(32)
-        protected_key = win32crypt.CryptProtectData(
-            key,
-            "MindShield database key",
-            None,
-            None,
-            None,
-            0,
-        )
-        try:
-            with self.key_path.open("xb") as key_file:
-                key_file.write(protected_key)
-        except FileExistsError:
-            try:
-                existing_key = win32crypt.CryptUnprotectData(
-                    self.key_path.read_bytes(),
-                    None,
-                    None,
-                    None,
-                    0,
-                )[1]
-            except pywintypes.error as error:
-                raise RuntimeError(
-                    f"Cannot decrypt the MindShield database key at {self.key_path}"
-                ) from error
-            if len(existing_key) != 32:
-                raise ValueError("The protected MindShield database key is invalid")
-            return existing_key
-        return key
-
-    @staticmethod
-    def _verify_sqlcipher() -> None:
-        with closing(sqlite3.connect(":memory:")) as connection:
-            row = connection.execute("PRAGMA cipher_version").fetchone()
-            if row is None or not row[0]:
-                raise RuntimeError("MindShield requires a SQLCipher-enabled SQLite runtime")
-
-    def _encrypt_existing_database(self) -> None:
+    def _ensure_standard_sqlite_database(self) -> None:
         if not self.db_path.exists() or self.db_path.stat().st_size == 0:
             return
         with self.db_path.open("rb") as database_file:
             header = database_file.read(16)
         if header != b"SQLite format 3\x00":
-            return
-
-        temporary_path = self.db_path.with_name(
-            f"{self.db_path.name}.encrypted.tmp"
-        )
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-        connection = sqlite3.connect(self.db_path)
-        try:
-            connection.execute(
-                "ATTACH DATABASE ? AS encrypted KEY ?",
-                (str(temporary_path), f"x'{self._encryption_key.hex()}'"),
-            )
-            connection.execute("SELECT sqlcipher_export('encrypted')")
-            connection.execute("DETACH DATABASE encrypted")
-        except sqlite3.Error as error:
-            connection.close()
-            if temporary_path.exists():
-                temporary_path.unlink()
+            if self.key_path.is_file():
+                self._migrate_legacy_sqlcipher_database()
+                return
             raise RuntimeError(
-                f"Could not encrypt the existing database at {self.db_path}"
+                f"{self.db_path} is not a standard SQLite database. "
+                "Back up and migrate this database before using standard SQLite."
+            )
+
+    def _migrate_legacy_sqlcipher_database(self) -> None:
+        try:
+            import pywintypes
+            import sqlcipher3.dbapi2 as sqlcipher
+            import win32crypt
+        except ImportError as error:
+            raise RuntimeError(
+                "This legacy encrypted database requires the Windows SQLCipher "
+                "migration dependencies. The original database was not changed."
+            ) from error
+
+        try:
+            key = win32crypt.CryptUnprotectData(
+                self.key_path.read_bytes(),
+                None,
+                None,
+                None,
+                0,
+            )[1]
+        except (OSError, pywintypes.error) as error:
+            raise RuntimeError(
+                f"Could not decrypt the legacy database key at {self.key_path}. "
+                "The original database was not changed."
+            ) from error
+        if len(key) != 32:
+            raise RuntimeError(
+                f"The legacy database key at {self.key_path} is invalid. "
+                "The original database was not changed."
+            )
+
+        try:
+            with closing(sqlcipher.connect(str(self.db_path))) as encrypted:
+                encrypted.execute(f"PRAGMA key = \"x'{key.hex()}'\"")
+                integrity = encrypted.execute("PRAGMA quick_check").fetchone()
+                if integrity is None or integrity[0] != "ok":
+                    raise RuntimeError("The legacy SQLCipher database failed its integrity check")
+
+                tables = {
+                    row[0]
+                    for row in encrypted.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if "work_logs" not in tables:
+                    raise RuntimeError("The legacy database has no work_logs table")
+
+                work_log_columns = {
+                    row[1] for row in encrypted.execute("PRAGMA table_info(work_logs)")
+                }
+                work_zone_column = (
+                    "work_zone"
+                    if "work_zone" in work_log_columns
+                    else "work_zone_title"
+                    if "work_zone_title" in work_log_columns
+                    else None
+                )
+                if work_zone_column is None:
+                    raise RuntimeError("The legacy work_logs table has no work-zone column")
+                work_logs = encrypted.execute(
+                    "SELECT id, date, start_time, duration_minutes, "
+                    f"{work_zone_column} FROM work_logs"
+                ).fetchall()
+                settings = (
+                    encrypted.execute("SELECT key, value FROM settings").fetchall()
+                    if "settings" in tables
+                    else []
+                )
+                break_logs = (
+                    encrypted.execute(
+                        "SELECT id, date, started_at, duration_seconds, "
+                        "work_zone, completed_at FROM break_logs"
+                    ).fetchall()
+                    if "break_logs" in tables
+                    else []
+                )
+        except sqlcipher.Error as error:
+            raise RuntimeError(
+                "Could not read the legacy SQLCipher database. "
+                "The original database was not changed."
+            ) from error
+
+        temporary_fd, temporary_name = tempfile.mkstemp(
+            prefix=f"{self.db_path.name}.",
+            suffix=".sqlite.tmp",
+            dir=self.db_path.parent,
+        )
+        os.close(temporary_fd)
+        temporary_path = Path(temporary_name)
+        try:
+            with closing(sqlite3.connect(temporary_path)) as connection, connection:
+                self._create_schema(connection)
+                connection.executemany(
+                    """
+                    INSERT INTO work_logs
+                        (id, date, start_time, duration_minutes, work_zone)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    work_logs,
+                )
+                connection.executemany(
+                    "INSERT INTO settings (key, value) VALUES (?, ?)",
+                    settings,
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO break_logs
+                        (id, date, started_at, duration_seconds, work_zone, completed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    break_logs,
+                )
+                integrity = connection.execute("PRAGMA quick_check").fetchone()
+                if integrity is None or integrity[0] != "ok":
+                    raise RuntimeError("The migrated SQLite database failed its integrity check")
+
+            backup_path = self._create_legacy_backup()
+            os.replace(temporary_path, self.db_path)
+            self._migration_backup_path = backup_path
+        except (OSError, sqlite3.Error) as error:
+            raise RuntimeError(
+                "Could not migrate the legacy SQLCipher database. "
+                "The original database was not changed."
             ) from error
         finally:
-            connection.close()
-
-        try:
-            with closing(sqlite3.connect(temporary_path)) as encrypted:
-                encrypted.execute(
-                    f"PRAGMA key = \"x'{self._encryption_key.hex()}'\""
-                )
-                encrypted.execute("SELECT count(*) FROM sqlite_master").fetchone()
-            os.replace(temporary_path, self.db_path)
-        except (OSError, sqlite3.Error) as error:
             if temporary_path.exists():
                 temporary_path.unlink()
-            raise RuntimeError(
-                f"Could not finalize database encryption at {self.db_path}"
-            ) from error
+
+    def _create_legacy_backup(self) -> Path:
+        backup_path = self.db_path.with_name(
+            f"{self.db_path.name}.sqlcipher.bak"
+        )
+        if backup_path.is_file() and filecmp.cmp(
+            self.db_path,
+            backup_path,
+            shallow=False,
+        ):
+            return backup_path
+        suffix = 1
+        while backup_path.exists():
+            backup_path = self.db_path.with_name(
+                f"{self.db_path.name}.sqlcipher.{suffix}.bak"
+            )
+            if backup_path.is_file() and filecmp.cmp(
+                self.db_path,
+                backup_path,
+                shallow=False,
+            ):
+                return backup_path
+            suffix += 1
+
+        created_backup = False
+        try:
+            with self.db_path.open("rb") as source, backup_path.open("xb") as backup:
+                created_backup = True
+                shutil.copyfileobj(source, backup)
+                backup.flush()
+                os.fsync(backup.fileno())
+        except OSError:
+            if created_backup and backup_path.exists():
+                backup_path.unlink()
+            raise
+        return backup_path
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
-        connection.execute(f"PRAGMA key = \"x'{self._encryption_key.hex()}'\"")
         connection.row_factory = sqlite3.Row
         return connection
 
     def init_db(self) -> None:
         """Create the database schema, migrating the former work-zone column."""
         with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS work_logs (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT,
-                    start_time TEXT,
-                    duration_minutes INTEGER,
-                    work_zone TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT UNIQUE,
-                    value TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS break_logs (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    duration_seconds INTEGER NOT NULL,
-                    work_zone TEXT NOT NULL,
-                    completed_at TEXT
-                )
-                """
-            )
+            self._create_schema(connection)
             columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(work_logs)")
@@ -215,12 +257,72 @@ class DatabaseHandler:
                     "ALTER TABLE work_logs RENAME COLUMN work_zone_title TO work_zone"
                 )
 
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS work_logs (
+                id INTEGER PRIMARY KEY,
+                date TEXT,
+                start_time TEXT,
+                duration_minutes INTEGER,
+                work_zone TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT UNIQUE,
+                value TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS break_logs (
+                id INTEGER PRIMARY KEY,
+                date TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                work_zone TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+
     def log_scheduled_break_start(
         self,
         duration_seconds: int,
         work_zone: str,
     ) -> int:
         """Record an automatic eye-care break and return its database ID."""
+        now = datetime.now()
+        return self.add_break_log(
+            now.date().isoformat(),
+            now.strftime("%H:%M"),
+            duration_seconds,
+            work_zone,
+            False,
+        )
+
+    def add_break_log(
+        self,
+        break_date: str,
+        start_time: str,
+        duration_seconds: int,
+        work_zone: str,
+        completed: bool,
+    ) -> int:
+        """Add a scheduled-break record with explicit date, time, and status."""
+        try:
+            normalized_date = date.fromisoformat(break_date).isoformat()
+        except (TypeError, ValueError) as error:
+            raise ValueError("date must use YYYY-MM-DD format") from error
+        try:
+            normalized_time = datetime.strptime(start_time, "%H:%M").time()
+        except (TypeError, ValueError) as error:
+            raise ValueError("start_time must use HH:MM format") from error
         if (
             isinstance(duration_seconds, bool)
             or not isinstance(duration_seconds, int)
@@ -229,20 +331,34 @@ class DatabaseHandler:
             raise ValueError("duration_seconds must be a positive integer")
         if not isinstance(work_zone, str) or not work_zone.strip():
             raise ValueError("work_zone must be a non-empty string")
+        if not isinstance(completed, bool):
+            raise TypeError("completed must be a bool")
 
-        now = datetime.now()
+        started_at = datetime.combine(
+            date.fromisoformat(normalized_date),
+            normalized_time,
+        )
+        completed_at = (
+            (started_at + timedelta(seconds=duration_seconds)).isoformat(
+                timespec="seconds"
+            )
+            if completed
+            else None
+        )
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 """
-                INSERT INTO break_logs
-                    (date, started_at, duration_seconds, work_zone)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO break_logs (
+                    date, started_at, duration_seconds, work_zone, completed_at
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    now.date().isoformat(),
-                    now.isoformat(timespec="seconds"),
+                    normalized_date,
+                    started_at.isoformat(timespec="seconds"),
                     duration_seconds,
                     work_zone.strip(),
+                    completed_at,
                 ),
             )
             if cursor.lastrowid is None:
@@ -265,6 +381,109 @@ class DatabaseHandler:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Scheduled break {break_id} is missing or already complete")
+
+    def get_break_logs(
+        self,
+    ) -> list[tuple[int, str, str, int, str, bool]]:
+        """Return scheduled-break records for profile editing."""
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT id, date, started_at, duration_seconds, work_zone, completed_at
+                FROM break_logs
+                ORDER BY date DESC, started_at DESC, id DESC
+                """
+            ).fetchall()
+            return [
+                (
+                    int(row["id"]),
+                    str(row["date"]),
+                    str(row["started_at"]),
+                    int(row["duration_seconds"]),
+                    str(row["work_zone"]),
+                    row["completed_at"] is not None,
+                )
+                for row in rows
+            ]
+
+    def update_break_log(
+        self,
+        break_id: int,
+        break_date: str,
+        start_time: str,
+        duration_seconds: int,
+        work_zone: str,
+        completed: bool,
+    ) -> None:
+        """Edit a scheduled-break record and its completion status."""
+        if (
+            isinstance(break_id, bool)
+            or not isinstance(break_id, int)
+            or break_id <= 0
+        ):
+            raise ValueError("break_id must be a positive integer")
+        try:
+            normalized_date = date.fromisoformat(break_date).isoformat()
+        except (TypeError, ValueError) as error:
+            raise ValueError("date must use YYYY-MM-DD format") from error
+        try:
+            normalized_time = datetime.strptime(start_time, "%H:%M").time()
+        except (TypeError, ValueError) as error:
+            raise ValueError("start_time must use HH:MM format") from error
+        if (
+            isinstance(duration_seconds, bool)
+            or not isinstance(duration_seconds, int)
+            or duration_seconds <= 0
+        ):
+            raise ValueError("duration_seconds must be a positive integer")
+        if not isinstance(work_zone, str) or not work_zone.strip():
+            raise ValueError("work_zone must be a non-empty string")
+        if not isinstance(completed, bool):
+            raise TypeError("completed must be a bool")
+
+        started_at = datetime.combine(
+            date.fromisoformat(normalized_date),
+            normalized_time,
+        ).isoformat(timespec="seconds")
+        completed_at = (
+            (
+                datetime.fromisoformat(started_at)
+                + timedelta(seconds=duration_seconds)
+            ).isoformat(timespec="seconds")
+            if completed
+            else None
+        )
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE break_logs
+                SET date = ?, started_at = ?, duration_seconds = ?,
+                    work_zone = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized_date,
+                    started_at,
+                    duration_seconds,
+                    work_zone.strip(),
+                    completed_at,
+                    break_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Scheduled break {break_id} does not exist")
+
+    def delete_break_log(self, break_id: int) -> None:
+        """Delete a scheduled-break record by ID."""
+        if isinstance(break_id, bool) or not isinstance(break_id, int) or break_id <= 0:
+            raise ValueError("break_id must be a positive integer")
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM break_logs WHERE id = ?",
+                (break_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Scheduled break {break_id} does not exist")
 
     def get_monthly_break_compliance(self) -> tuple[int, int]:
         """Return completed and total scheduled breaks for the current month."""
@@ -339,6 +558,30 @@ class DatabaseHandler:
 
     def log_session(self, duration_mins: int, work_zone: str) -> None:
         """Store a completed session."""
+        now = datetime.now()
+        self.add_work_log(
+            now.date().isoformat(),
+            now.time().strftime("%H:%M"),
+            duration_mins,
+            work_zone,
+        )
+
+    def add_work_log(
+        self,
+        log_date: str,
+        start_time: str,
+        duration_mins: int,
+        work_zone: str,
+    ) -> None:
+        """Add a focus session with an explicitly selected date and time."""
+        try:
+            normalized_date = date.fromisoformat(log_date).isoformat()
+        except (TypeError, ValueError) as error:
+            raise ValueError("date must use YYYY-MM-DD format") from error
+        try:
+            normalized_time = datetime.strptime(start_time, "%H:%M").time()
+        except (TypeError, ValueError) as error:
+            raise ValueError("start_time must use HH:MM format") from error
         if (
             isinstance(duration_mins, bool)
             or not isinstance(duration_mins, int)
@@ -348,7 +591,6 @@ class DatabaseHandler:
         if not isinstance(work_zone, str) or not work_zone.strip():
             raise ValueError("work_zone must be a non-empty string")
 
-        now = datetime.now()
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
@@ -356,11 +598,103 @@ class DatabaseHandler:
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    now.date().isoformat(),
-                    now.time().isoformat(timespec="seconds"),
+                    normalized_date,
+                    normalized_time.isoformat(timespec="seconds"),
                     duration_mins,
                     work_zone.strip(),
                 ),
+            )
+
+    def get_work_logs(self) -> list[tuple[int, str, str, int, str]]:
+        """Return all focus sessions ordered newest first for profile editing."""
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT id, date, start_time, duration_minutes, work_zone
+                FROM work_logs
+                ORDER BY date DESC, start_time DESC, id DESC
+                """
+            ).fetchall()
+            return [
+                (
+                    int(row["id"]),
+                    str(row["date"]),
+                    str(row["start_time"]),
+                    int(row["duration_minutes"]),
+                    str(row["work_zone"]),
+                )
+                for row in rows
+            ]
+
+    def update_work_log(
+        self,
+        log_id: int,
+        log_date: str,
+        start_time: str,
+        duration_mins: int,
+        work_zone: str,
+    ) -> None:
+        """Update a focus session and reject invalid dates, times, or values."""
+        if isinstance(log_id, bool) or not isinstance(log_id, int) or log_id <= 0:
+            raise ValueError("log_id must be a positive integer")
+        try:
+            normalized_date = date.fromisoformat(log_date).isoformat()
+        except (TypeError, ValueError) as error:
+            raise ValueError("date must use YYYY-MM-DD format") from error
+        try:
+            normalized_time = datetime.strptime(start_time, "%H:%M").time()
+        except (TypeError, ValueError) as error:
+            raise ValueError("start_time must use HH:MM format") from error
+        if (
+            isinstance(duration_mins, bool)
+            or not isinstance(duration_mins, int)
+            or duration_mins <= 0
+        ):
+            raise ValueError("duration_mins must be a positive integer")
+        if not isinstance(work_zone, str) or not work_zone.strip():
+            raise ValueError("work_zone must be a non-empty string")
+
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE work_logs
+                SET date = ?, start_time = ?, duration_minutes = ?, work_zone = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized_date,
+                    normalized_time.isoformat(timespec="seconds"),
+                    duration_mins,
+                    work_zone.strip(),
+                    log_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Focus session {log_id} does not exist")
+
+    def delete_work_log(self, log_id: int) -> None:
+        """Delete one focus session by ID."""
+        if isinstance(log_id, bool) or not isinstance(log_id, int) or log_id <= 0:
+            raise ValueError("log_id must be a positive integer")
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM work_logs WHERE id = ?",
+                (log_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Focus session {log_id} does not exist")
+
+    def reset_analytics(self) -> None:
+        """Clear focus and break history while preserving user preferences."""
+        with closing(self._connect()) as connection, connection:
+            connection.execute("DELETE FROM work_logs")
+            connection.execute("DELETE FROM break_logs")
+            connection.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES ('demo_data_seeded', 'true')
+                ON CONFLICT(key) DO UPDATE SET value = 'true'
+                """
             )
 
     def get_todays_total_minutes(self) -> int:
@@ -436,7 +770,17 @@ class DatabaseHandler:
             count = connection.execute(
                 "SELECT COUNT(*) FROM work_logs"
             ).fetchone()[0]
-            if count:
+            seeded = connection.execute(
+                "SELECT value FROM settings WHERE key = 'demo_data_seeded'"
+            ).fetchone()
+            if count or (seeded is not None and seeded["value"] == "true"):
+                connection.execute(
+                    """
+                    INSERT INTO settings (key, value)
+                    VALUES ('demo_data_seeded', 'true')
+                    ON CONFLICT(key) DO UPDATE SET value = 'true'
+                    """
+                )
                 return
 
             demo_rows: list[tuple[str, str, int, str]] = []
@@ -459,4 +803,11 @@ class DatabaseHandler:
                 VALUES (?, ?, ?, ?)
                 """,
                 demo_rows,
+            )
+            connection.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES ('demo_data_seeded', 'true')
+                ON CONFLICT(key) DO UPDATE SET value = 'true'
+                """
             )

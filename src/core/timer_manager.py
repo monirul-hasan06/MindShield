@@ -162,7 +162,7 @@ class TimerManager:
             now = time.monotonic()
             if self._mode == "work" and self._deadline is not None:
                 self._remaining_when_paused = max(0.0, self._deadline - now)
-            else:
+            elif self._mode != "paused":
                 self._remaining_when_paused = self._work_interval_sec
 
             self._mode = "manual_break"

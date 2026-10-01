@@ -6,6 +6,19 @@ from src.core.window_tracker import WindowTracker
 
 
 class WindowTrackerMatchingTests(unittest.TestCase):
+    def test_work_zone_can_be_updated_while_tracking(self) -> None:
+        tracker = WindowTracker("Visual Studio Code")
+
+        tracker.set_work_zone("YouTube")
+
+        self.assertEqual(tracker.active_work_zone, "YouTube")
+        self.assertTrue(
+            WindowTracker._matches_work_zone(
+                tracker.active_work_zone,
+                "Study playlist - YouTube",
+            )
+        )
+
     def test_matches_window_title_case_insensitively(self) -> None:
         self.assertTrue(
             WindowTracker._matches_work_zone(

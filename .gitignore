@@ -18,6 +18,7 @@ env/
 # Local databases, SQLCipher keys, and SQLite sidecars
 *.db
 *.db-*
+*.db.sqlcipher*.bak
 *.sqlite
 *.sqlite-*
 *.key.dpapi

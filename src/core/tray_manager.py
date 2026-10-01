@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import threading
-from typing import Protocol
-from typing import Any
+from typing import Any, Protocol
 
 import pystray
-from PIL import Image, ImageDraw
+
+from PIL import Image
+
+from src.core.app_icon import get_app_icon_image
 
 
 class TrayWindow(Protocol):
@@ -46,8 +48,8 @@ class TrayManager:
         self.app_instance = app_instance
         self.window = app_instance
         self.on_meeting_mode = on_meeting_mode or getattr(
-            app_instance, "_start_meeting_break", None
-        )
+            app_instance, "_start_one_hour_meeting_break", None
+        ) or getattr(app_instance, "_start_meeting_break", None)
         self.on_exit = on_exit or app_instance.destroy
         self._icon = pystray.Icon(
             "MindShield",
@@ -56,7 +58,7 @@ class TrayManager:
             menu=pystray.Menu(
                 pystray.MenuItem("Open MindShield", self._open_window, default=True),
                 pystray.MenuItem(
-                    "Pause / Meeting Mode (saved duration)",
+                    "Pause / Meeting Mode (1 Hr)",
                     self._meeting_mode,
                     enabled=self.on_meeting_mode is not None,
                 ),
@@ -69,13 +71,8 @@ class TrayManager:
 
     @staticmethod
     def _create_icon_image() -> Image.Image:
-        """Create a small app icon without requiring an external asset."""
-        image = Image.new("RGB", (64, 64), "#14213d")
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((10, 10, 54, 54), radius=12, fill="#38bdf8")
-        draw.ellipse((23, 18, 41, 36), fill="#14213d")
-        draw.rounded_rectangle((20, 34, 44, 47), radius=6, fill="#14213d")
-        return image
+        """Load the square M mark from the shared MindShield wordmark."""
+        return get_app_icon_image((64, 64))
 
     def start(self) -> None:
         """Start the tray event loop on a background daemon thread."""

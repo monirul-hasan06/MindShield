@@ -5,8 +5,16 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/mindshield.ico', 'assets')],
-    hiddenimports=[],
+    datas=[
+        ('assets/mindshield.ico', 'assets'),
+        ('assets/mindshield-logo.png', 'assets'),
+        ('assets/fonts/Orbitron-Bold.ttf', 'assets/fonts'),
+        ('assets/fonts/OFL.txt', 'assets/fonts'),
+    ],
+    hiddenimports=[
+        'sqlcipher3.dbapi2',
+        'win32crypt',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
