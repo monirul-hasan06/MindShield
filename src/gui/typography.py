@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import logging
 from pathlib import Path
+import sys
 from typing import Any
 
 import customtkinter as ctk
