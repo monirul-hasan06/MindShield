@@ -8,10 +8,8 @@ from src.gui.main_window import MainWindow
 
 
 def main() -> None:
-    """Initialize persistence, seed an empty database, and launch the GUI."""
+    """Initialize persistence and launch the GUI."""
     database = DatabaseHandler()
-    database.init_db()
-    database.seed_demo_data()
 
     timer_manager = TimerManager()
     window_tracker = WindowTracker(active_work_zone="Focus")

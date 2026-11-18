@@ -1,0 +1,68 @@
+# MindShield
+
+MindShield is a Windows desktop focus app. It provides customizable focus timers, timed breaks, an optional reversible app focus guard, named work-zone profiles, distraction minimization, a system tray, searchable session history with CSV export, local productivity analytics, and encrypted local settings and activity logs.
+
+## Requirements and development
+
+- Windows 10 or later
+- Python 3.14 (the version used to validate this project)
+- Inno Setup 6 for building the installer
+
+From the repository root, create and activate a virtual environment, install dependencies, and run the app:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python main.py
+```
+
+Run the test suite with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## Privacy and stored data
+
+Window monitoring runs only during a work session. MindShield reads only the active window details needed by enabled work-zone rules; matching a browser URL or an Explorer folder can also require reading accessible URL/path fields. Rules are enabled individually and use OR matching: any enabled rule can match. Optional suppression minimizes windows that do not match. The focus guard can keep the selected executable in front and minimize windows matching configured blocked rules. Window titles, URLs, and process details are used for matching and are not written to the activity database.
+
+Settings, including your profile name, work-zone profiles, focus logs, and scheduled-break logs are stored locally in a SQLCipher-encrypted database. The database key is protected with Windows DPAPI for the current Windows user. No account, cloud sync, or telemetry is used. A new database starts without demo activity. Existing records are retained.
+
+Create and restore backups from **Settings → Privacy & local data**. A backup contains the encrypted database and its DPAPI-protected key, not a plaintext key. It can be restored only by the same Windows user account that created it. Restoring replaces the current activity history and settings; export the current data first if you may need it. MindShield closes after a successful restore so the restored settings are loaded on the next launch.
+
+For a packaged install, user data is kept outside the application folder at `%LOCALAPPDATA%\MindShield`. Uninstalling the app does not remove that user data.
+When running from source, the database is stored as `mindshield.db` in the repository root (the file is git-ignored); the DPAPI-protected key remains under the current user's LocalAppData.
+
+## Build and install
+
+Build the one-folder application from the repository root:
+
+```powershell
+pyinstaller MindShield.spec
+```
+
+The output is `dist\MindShield`. Compile `MindShield.iss` with Inno Setup 6 to create `installer_output\MindShield_Setup.exe`. The installer keeps the existing machine-wide install location and requires administrator privileges to preserve the established upgrade path. Application data remains per-user under LocalAppData. `inno_setup\setup_script.iss` includes the root installer script for compatibility with existing build instructions.
+
+## Current behavior and limitations
+
+- Work-zone profiles can match window titles, process names, executable paths, browser URLs, and Explorer folder paths where Windows exposes them through accessibility controls.
+- Dashboard, Profile & Analytics, Settings, onboarding, and nested rule lists support eased vertical scrolling with the mouse wheel/touchpad, click-and-drag, or Page Up/Page Down/Home/End keys.
+- Distraction suppression is optional and disabled by default.
+- Set the focus and automatic eye-care interval from 1 to 240 minutes on the Dashboard or in Settings. The eye-care break length is separately adjustable in seconds. Starting work with a custom Dashboard interval saves it as the next default.
+- The optional focus guard uses a selected `.exe` as the work app. It minimizes other applications and can also minimize matching blocked windows within the selected app. It is reversible: pausing or stopping releases the guard, and breaks temporarily suspend it. When a break ends, MindShield activates or relaunches the selected app.
+- The focus guard is best-effort, not an operating-system lock. It checks the active window, cannot control secure Windows shortcuts or reliably inspect background browser tabs, and may minimize the whole browser when its active tab matches a blocked rule. URL checks depend on what the browser exposes through Windows accessibility controls.
+- Start manual 5-, 10-, or 15-minute breaks from the Dashboard. Automatic eye-care breaks follow the configured focus interval and use the separately configured eye-care break length.
+- Demo mode shortens work and break intervals for demonstrations; it is not enabled by default.
+- Choose Light, Dark, or System appearance and Small, Default, or Large text; Dark remains the default.
+- First-run onboarding asks for a name used in the Dashboard's time-of-day greeting. Its feature walkthrough can be skipped and replayed from Settings; you can update your name there as well. Break reminders can show the eye-care prompt, a stretch prompt, a hydration prompt, or no prompt.
+- Session history can be filtered to the last 7 days, last 30 days, or all history, and searched by work-zone name. CSV export uses the same filters and includes only date, start time, duration, and work-zone name.
+- The productivity profile totals recorded work-segment time and completed manual or scheduled breaks. Paused time is excluded; active work is committed when paused, stopped, or transitioned to a break, so an abrupt app exit can leave the current segment unrecorded.
+- Use **Profile & Analytics → Reset Analytics** to clear saved focus totals, break history, and session history while keeping settings and work-zone profiles. MindShield asks for confirmation; active work restarts its tracked duration from zero, and an in-progress break remains tracked.
+- MindShield currently targets Windows; it does not provide cloud sync or cross-device data transfer.
+
+## Suggested next updates
+
+1. Improve keyboard navigation and screen-reader labels.
+2. Consider additional analytics views while keeping window metadata out of stored history.
+3. Add localization after the user-facing workflows are stable.

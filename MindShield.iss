@@ -11,7 +11,8 @@ UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\MindShield.exe
 DefaultDirName={autopf}\MindShield
 DefaultGroupName={#MyAppName}
-OutputBaseFilename=MindShield-Setup
+OutputDir=installer_output
+OutputBaseFilename=MindShield_Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -22,8 +23,11 @@ PrivilegesRequired=admin
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
-Source: "dist\branded\MindShield\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\MindShield\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\MindShield.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\MindShield.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\MindShield.exe"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

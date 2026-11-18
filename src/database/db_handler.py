@@ -2,20 +2,80 @@
 
 from __future__ import annotations
 
+import csv
 import os
 import secrets
+import shutil
 import sys
+import tempfile
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from collections.abc import Sequence
+from zipfile import ZIP_STORED, BadZipFile, ZipFile
 
 import pywintypes
 import sqlcipher3.dbapi2 as sqlite3
 import win32crypt
 
 
+@dataclass(frozen=True)
+class WorkZoneRule:
+    """A persisted substring rule used to match an active window."""
+
+    id: int
+    match_type: str
+    pattern: str
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class WorkZoneProfile:
+    """A named set of work-zone matching rules."""
+
+    id: int
+    name: str
+    rules: tuple[WorkZoneRule, ...]
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    """A focus session row safe to show in history and export to CSV."""
+
+    date: str
+    start_time: str
+    duration_minutes: int
+    work_zone: str
+
+
+@dataclass(frozen=True)
+class FocusGuardRule:
+    """A local rule identifying an application or active-window distraction."""
+
+    id: int
+    match_type: str
+    pattern: str
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class ProductivitySummary:
+    """Recorded work and completed-break time for a selected date range."""
+
+    work_seconds: int
+    break_seconds: int
+
+
 class DatabaseHandler:
     """Create and access MindShield's per-user encrypted SQLCipher database."""
+
+    WORK_ZONE_MATCH_TYPES = frozenset(
+        {"any", "title", "process", "path", "accessible"}
+    )
+    FOCUS_GUARD_MATCH_TYPES = frozenset(
+        {"title", "process", "path", "accessible"}
+    )
 
     def __init__(
         self,
@@ -67,21 +127,7 @@ class DatabaseHandler:
 
     def _load_encryption_key(self) -> bytes:
         if self.key_path.exists():
-            try:
-                key = win32crypt.CryptUnprotectData(
-                    self.key_path.read_bytes(),
-                    None,
-                    None,
-                    None,
-                    0,
-                )[1]
-            except pywintypes.error as error:
-                raise RuntimeError(
-                    f"Cannot decrypt the MindShield database key at {self.key_path}"
-                ) from error
-            if len(key) != 32:
-                raise ValueError("The protected MindShield database key is invalid")
-            return key
+            return self._unprotect_key(self.key_path.read_bytes())
 
         key = secrets.token_bytes(32)
         protected_key = win32crypt.CryptProtectData(
@@ -96,21 +142,24 @@ class DatabaseHandler:
             with self.key_path.open("xb") as key_file:
                 key_file.write(protected_key)
         except FileExistsError:
-            try:
-                existing_key = win32crypt.CryptUnprotectData(
-                    self.key_path.read_bytes(),
-                    None,
-                    None,
-                    None,
-                    0,
-                )[1]
-            except pywintypes.error as error:
-                raise RuntimeError(
-                    f"Cannot decrypt the MindShield database key at {self.key_path}"
-                ) from error
-            if len(existing_key) != 32:
-                raise ValueError("The protected MindShield database key is invalid")
-            return existing_key
+            return self._unprotect_key(self.key_path.read_bytes())
+        return key
+
+    def _unprotect_key(self, protected_key: bytes) -> bytes:
+        try:
+            key = win32crypt.CryptUnprotectData(
+                protected_key,
+                None,
+                None,
+                None,
+                0,
+            )[1]
+        except pywintypes.error as error:
+            raise RuntimeError(
+                f"Cannot decrypt the MindShield database key at {self.key_path}"
+            ) from error
+        if len(key) != 32:
+            raise ValueError("The protected MindShield database key is invalid")
         return key
 
     @staticmethod
@@ -169,8 +218,161 @@ class DatabaseHandler:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.execute(f"PRAGMA key = \"x'{self._encryption_key.hex()}'\"")
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.row_factory = sqlite3.Row
         return connection
+
+    def backup_to(self, backup_path: str | Path) -> None:
+        """Write an encrypted database and its user-protected key to a backup."""
+        target = Path(backup_path).expanduser()
+        resolved_target = target.resolve()
+        if resolved_target in (self.db_path.resolve(), self.key_path.resolve()):
+            raise ValueError("The backup path must not overwrite MindShield data")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        staged_archive: Path | None = None
+        try:
+            with tempfile.TemporaryDirectory(dir=target.parent) as temp_dir:
+                exported_database = Path(temp_dir) / "mindshield.db"
+                with closing(self._connect()) as connection:
+                    try:
+                        connection.execute(
+                            "ATTACH DATABASE ? AS backup KEY ?",
+                            (
+                                str(exported_database),
+                                f"x'{self._encryption_key.hex()}'",
+                            ),
+                        )
+                        connection.execute("SELECT sqlcipher_export('backup')")
+                        connection.execute("DETACH DATABASE backup")
+                    except sqlite3.Error as error:
+                        raise RuntimeError("Could not export the encrypted database") from error
+
+                with tempfile.NamedTemporaryFile(
+                    prefix=f".{target.name}.",
+                    suffix=".tmp",
+                    dir=target.parent,
+                    delete=False,
+                ) as temporary_archive:
+                    staged_archive = Path(temporary_archive.name)
+                with ZipFile(staged_archive, "w") as archive:
+                    archive.write(exported_database, "mindshield.db")
+                    archive.write(self.key_path, "database.key.dpapi")
+            os.replace(staged_archive, target)
+        except (OSError, BadZipFile) as error:
+            raise RuntimeError(f"Could not create MindShield backup at {target}") from error
+        finally:
+            if staged_archive is not None and staged_archive.exists():
+                staged_archive.unlink()
+
+    def restore_from(self, backup_path: str | Path) -> None:
+        """Restore a backup created by :meth:`backup_to` for this Windows user.
+
+        Callers must ensure no work or break phase is active. The current database
+        and key are replaced only after the archive and restored database have been
+        verified.
+        """
+        source = Path(backup_path).expanduser()
+        if source.resolve() in (self.db_path.resolve(), self.key_path.resolve()):
+            raise ValueError("The backup path must not be a MindShield data file")
+
+        staged_database: Path | None = None
+        staged_key: Path | None = None
+        previous_database: Path | None = None
+        previous_key: Path | None = None
+        old_encryption_key = self._encryption_key
+        installed_database = False
+        installed_key = False
+
+        try:
+            with ZipFile(source, "r") as archive:
+                entries = archive.infolist()
+                if (
+                    len(entries) != 2
+                    or {entry.filename for entry in entries}
+                    != {"mindshield.db", "database.key.dpapi"}
+                    or any(entry.flag_bits & 0x1 for entry in entries)
+                    or any(entry.compress_type != ZIP_STORED for entry in entries)
+                ):
+                    raise ValueError("The selected file is not a valid MindShield backup")
+                key_info = archive.getinfo("database.key.dpapi")
+                if key_info.file_size > 4096:
+                    raise ValueError("The protected database key in the backup is invalid")
+                protected_key = archive.read(key_info)
+                restored_key = self._unprotect_key(protected_key)
+
+                staged_database = self._create_staging_file(self.db_path.parent, ".db")
+                staged_key = self._create_staging_file(self.key_path.parent, ".key.dpapi")
+                with archive.open("mindshield.db") as archive_database:
+                    with staged_database.open("wb") as database_file:
+                        shutil.copyfileobj(archive_database, database_file)
+                staged_key.write_bytes(protected_key)
+
+            self._verify_database_file(staged_database, restored_key)
+            previous_database = self._reserve_staging_path(self.db_path.parent, ".previous.db")
+            previous_key = self._reserve_staging_path(self.key_path.parent, ".previous.key")
+            if self.db_path.exists():
+                os.replace(self.db_path, previous_database)
+            else:
+                previous_database = None
+            if self.key_path.exists():
+                os.replace(self.key_path, previous_key)
+            else:
+                previous_key = None
+
+            os.replace(staged_key, self.key_path)
+            installed_key = True
+            os.replace(staged_database, self.db_path)
+            installed_database = True
+            self._encryption_key = restored_key
+            self.init_db()
+        except Exception:
+            if installed_database and self.db_path.exists():
+                self.db_path.unlink()
+            if installed_key and self.key_path.exists():
+                self.key_path.unlink()
+            if previous_database is not None and previous_database.exists():
+                os.replace(previous_database, self.db_path)
+            if previous_key is not None and previous_key.exists():
+                os.replace(previous_key, self.key_path)
+            self._encryption_key = old_encryption_key
+            raise
+        finally:
+            for temporary_path in (
+                staged_database,
+                staged_key,
+                previous_database,
+                previous_key,
+            ):
+                if temporary_path is not None and temporary_path.exists():
+                    temporary_path.unlink()
+
+    @staticmethod
+    def _create_staging_file(directory: Path, suffix: str) -> Path:
+        descriptor, name = tempfile.mkstemp(
+            prefix=".mindshield-restore-",
+            suffix=suffix,
+            dir=directory,
+        )
+        os.close(descriptor)
+        return Path(name)
+
+    @staticmethod
+    def _reserve_staging_path(directory: Path, suffix: str) -> Path:
+        path = DatabaseHandler._create_staging_file(directory, suffix)
+        path.unlink()
+        return path
+
+    @staticmethod
+    def _verify_database_file(database_path: Path, key: bytes) -> None:
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute(f"PRAGMA key = \"x'{key.hex()}'\"")
+                connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error as error:
+            raise ValueError(
+                "The backup database is corrupt or its key does not match"
+            ) from error
 
     def init_db(self) -> None:
         """Create the database schema, migrating the former work-zone column."""
@@ -202,7 +404,38 @@ class DatabaseHandler:
                     started_at TEXT NOT NULL,
                     duration_seconds INTEGER NOT NULL,
                     work_zone TEXT NOT NULL,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    break_type TEXT NOT NULL DEFAULT 'scheduled'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS focus_guard_rules (
+                    id INTEGER PRIMARY KEY,
+                    match_type TEXT NOT NULL,
+                    pattern TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS work_zone_profiles (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS work_zone_rules (
+                    id INTEGER PRIMARY KEY,
+                    profile_id INTEGER NOT NULL
+                        REFERENCES work_zone_profiles(id) ON DELETE CASCADE,
+                    match_type TEXT NOT NULL,
+                    pattern TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
                 )
                 """
             )
@@ -214,13 +447,122 @@ class DatabaseHandler:
                 connection.execute(
                     "ALTER TABLE work_logs RENAME COLUMN work_zone_title TO work_zone"
                 )
+                columns.remove("work_zone_title")
+                columns.add("work_zone")
+            if "duration_seconds" not in columns:
+                connection.execute(
+                    "ALTER TABLE work_logs "
+                    "ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    "UPDATE work_logs SET duration_seconds = "
+                    "COALESCE(duration_minutes, 0) * 60"
+                )
+            break_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(break_logs)")
+            }
+            if "break_type" not in break_columns:
+                connection.execute(
+                    "ALTER TABLE break_logs "
+                    "ADD COLUMN break_type TEXT NOT NULL DEFAULT 'scheduled'"
+                )
+            self._migrate_work_zone_profiles(connection)
+
+    def _migrate_work_zone_profiles(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        profiles = connection.execute(
+            "SELECT id, name FROM work_zone_profiles ORDER BY id"
+        ).fetchall()
+        legacy_zone = connection.execute(
+            "SELECT value FROM settings WHERE key = 'active_work_zone'"
+        ).fetchone()
+        legacy_name = legacy_zone["value"] if legacy_zone is not None else None
+        if legacy_name is not None and not legacy_name.strip():
+            raise ValueError("Saved active work zone must not be empty")
+
+        if not profiles:
+            profile_name = legacy_name or "Focus"
+            cursor = connection.execute(
+                "INSERT INTO work_zone_profiles (name) VALUES (?)",
+                (profile_name,),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("Could not create the default work-zone profile")
+            profile_id = cursor.lastrowid
+            connection.execute(
+                """
+                INSERT INTO work_zone_rules (profile_id, match_type, pattern, enabled)
+                VALUES (?, 'any', ?, 1)
+                """,
+                (profile_id, legacy_name or profile_name),
+            )
+            self._store_active_profile(connection, profile_id, profile_name)
+            return
+
+        active_id_setting = connection.execute(
+            "SELECT value FROM settings WHERE key = 'active_work_zone_profile_id'"
+        ).fetchone()
+        active_profile = None
+        if active_id_setting is not None:
+            try:
+                active_id = int(active_id_setting["value"])
+            except (TypeError, ValueError):
+                active_id = -1
+            active_profile = connection.execute(
+                "SELECT id, name FROM work_zone_profiles WHERE id = ?",
+                (active_id,),
+            ).fetchone()
+
+        if active_profile is None:
+            active_profile = profiles[0]
+            self._store_active_profile(
+                connection,
+                int(active_profile["id"]),
+                str(active_profile["name"]),
+            )
+
+        rule_count = connection.execute(
+            "SELECT COUNT(*) FROM work_zone_rules WHERE profile_id = ?",
+            (active_profile["id"],),
+        ).fetchone()[0]
+        if not rule_count:
+            pattern = legacy_name or str(active_profile["name"])
+            connection.execute(
+                """
+                INSERT INTO work_zone_rules (profile_id, match_type, pattern, enabled)
+                VALUES (?, 'any', ?, 1)
+                """,
+                (active_profile["id"], pattern),
+            )
+
+    @staticmethod
+    def _store_active_profile(
+        connection: sqlite3.Connection,
+        profile_id: int,
+        name: str,
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            [
+                ("active_work_zone_profile_id", str(profile_id)),
+                ("active_work_zone", name),
+            ],
+        )
 
     def log_scheduled_break_start(
         self,
         duration_seconds: int,
         work_zone: str,
+        break_type: str = "scheduled",
     ) -> int:
-        """Record an automatic eye-care break and return its database ID."""
+        """Record a timed break and return its database ID."""
         if (
             isinstance(duration_seconds, bool)
             or not isinstance(duration_seconds, int)
@@ -229,20 +571,23 @@ class DatabaseHandler:
             raise ValueError("duration_seconds must be a positive integer")
         if not isinstance(work_zone, str) or not work_zone.strip():
             raise ValueError("work_zone must be a non-empty string")
+        if break_type not in ("scheduled", "manual"):
+            raise ValueError("break_type must be 'scheduled' or 'manual'")
 
         now = datetime.now()
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
                 """
                 INSERT INTO break_logs
-                    (date, started_at, duration_seconds, work_zone)
-                VALUES (?, ?, ?, ?)
+                    (date, started_at, duration_seconds, work_zone, break_type)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     now.date().isoformat(),
                     now.isoformat(timespec="seconds"),
                     duration_seconds,
                     work_zone.strip(),
+                    break_type,
                 ),
             )
             if cursor.lastrowid is None:
@@ -278,6 +623,7 @@ class DatabaseHandler:
                     COUNT(*)
                 FROM break_logs
                 WHERE date BETWEEN ? AND ?
+                    AND break_type = 'scheduled'
                 """,
                 (month_start, today),
             ).fetchone()
@@ -337,6 +683,256 @@ class DatabaseHandler:
                 [(key.strip(), value) for key, value in settings.items()],
             )
 
+    def list_work_zone_profiles(self) -> list[WorkZoneProfile]:
+        """Return all named work-zone profiles and their rules."""
+        with closing(self._connect()) as connection, connection:
+            profile_rows = connection.execute(
+                "SELECT id, name FROM work_zone_profiles ORDER BY id"
+            ).fetchall()
+            rule_rows = connection.execute(
+                """
+                SELECT id, profile_id, match_type, pattern, enabled
+                FROM work_zone_rules
+                ORDER BY profile_id, id
+                """
+            ).fetchall()
+
+        rules_by_profile: dict[int, list[WorkZoneRule]] = {}
+        for row in rule_rows:
+            profile_id = int(row["profile_id"])
+            rules_by_profile.setdefault(profile_id, []).append(
+                WorkZoneRule(
+                    id=int(row["id"]),
+                    match_type=str(row["match_type"]),
+                    pattern=str(row["pattern"]),
+                    enabled=bool(row["enabled"]),
+                )
+            )
+        return [
+            WorkZoneProfile(
+                id=int(row["id"]),
+                name=str(row["name"]),
+                rules=tuple(rules_by_profile.get(int(row["id"]), ())),
+            )
+            for row in profile_rows
+        ]
+
+    def get_active_work_zone_profile(self) -> WorkZoneProfile:
+        """Return the active work-zone profile, falling back to the first one."""
+        profiles = self.list_work_zone_profiles()
+        if not profiles:
+            raise RuntimeError("MindShield has no work-zone profiles")
+
+        setting = self.get_setting("active_work_zone_profile_id")
+        try:
+            active_id = int(setting) if setting is not None else -1
+        except ValueError:
+            active_id = -1
+        return next(
+            (profile for profile in profiles if profile.id == active_id),
+            profiles[0],
+        )
+
+    def save_work_zone_profile(
+        self,
+        name: str,
+        rules: Sequence[tuple[str, str, bool]],
+        profile_id: int | None = None,
+    ) -> int:
+        """Create or update a profile with typed, enabled substring rules."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Profile name must be a non-empty string")
+        if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
+            raise TypeError("rules must be a sequence of rule tuples")
+        normalized_rules: list[tuple[str, str, int]] = []
+        for rule in rules:
+            if not isinstance(rule, tuple) or len(rule) != 3:
+                raise ValueError("Each rule must contain a type, pattern, and enabled flag")
+            match_type, pattern, enabled = rule
+            if match_type not in self.WORK_ZONE_MATCH_TYPES:
+                raise ValueError(f"Unsupported work-zone match type: {match_type!r}")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError("Work-zone match patterns must not be empty")
+            if not isinstance(enabled, bool):
+                raise TypeError("Rule enabled flags must be bool values")
+            normalized_rules.append((match_type, pattern.strip(), int(enabled)))
+        if not any(enabled for _, _, enabled in normalized_rules):
+            raise ValueError("Enable at least one work-zone rule")
+        if profile_id is not None and (
+            isinstance(profile_id, bool)
+            or not isinstance(profile_id, int)
+            or profile_id <= 0
+        ):
+            raise ValueError("profile_id must be a positive integer")
+
+        with closing(self._connect()) as connection, connection:
+            if profile_id is None:
+                cursor = connection.execute(
+                    "INSERT INTO work_zone_profiles (name) VALUES (?)",
+                    (name.strip(),),
+                )
+                if cursor.lastrowid is None:
+                    raise RuntimeError("Could not create work-zone profile")
+                profile_id = cursor.lastrowid
+            else:
+                cursor = connection.execute(
+                    "UPDATE work_zone_profiles SET name = ? WHERE id = ?",
+                    (name.strip(), profile_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(f"Work-zone profile {profile_id} does not exist")
+                connection.execute(
+                    "DELETE FROM work_zone_rules WHERE profile_id = ?",
+                    (profile_id,),
+                )
+
+            connection.executemany(
+                """
+                INSERT INTO work_zone_rules
+                    (profile_id, match_type, pattern, enabled)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (profile_id, match_type, pattern, enabled)
+                    for match_type, pattern, enabled in normalized_rules
+                ],
+            )
+            active_profile_id = connection.execute(
+                "SELECT value FROM settings WHERE key = 'active_work_zone_profile_id'"
+            ).fetchone()
+            if (
+                active_profile_id is not None
+                and active_profile_id["value"] == str(profile_id)
+            ):
+                self._store_active_profile(connection, profile_id, name.strip())
+            return profile_id
+
+    def set_active_work_zone_profile(self, profile_id: int) -> WorkZoneProfile:
+        """Select a profile and keep the legacy work-zone setting in sync."""
+        if isinstance(profile_id, bool) or not isinstance(profile_id, int) or profile_id <= 0:
+            raise ValueError("profile_id must be a positive integer")
+
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT id, name FROM work_zone_profiles WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Work-zone profile {profile_id} does not exist")
+            self._store_active_profile(connection, profile_id, str(row["name"]))
+
+        return next(
+            profile
+            for profile in self.list_work_zone_profiles()
+            if profile.id == profile_id
+        )
+
+    def delete_work_zone_profile(self, profile_id: int) -> None:
+        """Delete a profile unless it is the last available profile."""
+        if isinstance(profile_id, bool) or not isinstance(profile_id, int) or profile_id <= 0:
+            raise ValueError("profile_id must be a positive integer")
+
+        with closing(self._connect()) as connection, connection:
+            profile_count = connection.execute(
+                "SELECT COUNT(*) FROM work_zone_profiles"
+            ).fetchone()[0]
+            if profile_count <= 1:
+                raise ValueError("MindShield must keep at least one work-zone profile")
+            cursor = connection.execute(
+                "DELETE FROM work_zone_profiles WHERE id = ?",
+                (profile_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Work-zone profile {profile_id} does not exist")
+
+            active_id = connection.execute(
+                "SELECT value FROM settings WHERE key = 'active_work_zone_profile_id'"
+            ).fetchone()
+            if active_id is not None and active_id["value"] == str(profile_id):
+                replacement = connection.execute(
+                    "SELECT id, name FROM work_zone_profiles ORDER BY id LIMIT 1"
+                ).fetchone()
+                self._store_active_profile(
+                    connection,
+                    int(replacement["id"]),
+                    str(replacement["name"]),
+                )
+
+    def get_session_history(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        search: str = "",
+    ) -> list[SessionRecord]:
+        """Return filtered work-log rows without transient window metadata."""
+        if not isinstance(search, str):
+            raise TypeError("search must be text")
+        for value in (start_date, end_date):
+            if value is not None and (
+                not isinstance(value, date) or isinstance(value, datetime)
+            ):
+                raise TypeError("session history dates must be date values")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError("start_date must not be after end_date")
+
+        conditions: list[str] = []
+        parameters: list[str] = []
+        if start_date is not None:
+            conditions.append("date >= ?")
+            parameters.append(start_date.isoformat())
+        if end_date is not None:
+            conditions.append("date <= ?")
+            parameters.append(end_date.isoformat())
+        if search.strip():
+            conditions.append("instr(lower(work_zone), lower(?)) > 0")
+            parameters.append(search.strip())
+        where_clause = (
+            f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        )
+
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                f"""
+                SELECT date, start_time, duration_minutes, work_zone
+                FROM work_logs
+                {where_clause}
+                ORDER BY date DESC, start_time DESC, id DESC
+                """,
+                parameters,
+            ).fetchall()
+        return [
+            SessionRecord(
+                date=str(row["date"] or ""),
+                start_time=str(row["start_time"] or ""),
+                duration_minutes=int(row["duration_minutes"] or 0),
+                work_zone=str(row["work_zone"] or ""),
+            )
+            for row in rows
+        ]
+
+    def export_sessions_csv(
+        self,
+        file_path: str | Path,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        search: str = "",
+    ) -> int:
+        """Export the matching date/time/duration/work-zone history to CSV."""
+        records = self.get_session_history(start_date, end_date, search)
+        with Path(file_path).open("w", encoding="utf-8-sig", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(("Date", "Start time", "Duration (minutes)", "Work zone"))
+            writer.writerows(
+                (
+                    record.date,
+                    record.start_time,
+                    record.duration_minutes,
+                    record.work_zone,
+                )
+                for record in records
+            )
+        return len(records)
+
     def log_session(self, duration_mins: int, work_zone: str) -> None:
         """Store a completed session."""
         if (
@@ -352,16 +948,174 @@ class DatabaseHandler:
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
-                INSERT INTO work_logs (date, start_time, duration_minutes, work_zone)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO work_logs
+                    (date, start_time, duration_minutes, work_zone, duration_seconds)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     now.date().isoformat(),
                     now.time().isoformat(timespec="seconds"),
                     duration_mins,
                     work_zone.strip(),
+                    duration_mins * 60,
                 ),
             )
+
+    def log_work_segment(self, duration_seconds: int, work_zone: str) -> None:
+        """Store an active work segment with second-level duration."""
+        if (
+            isinstance(duration_seconds, bool)
+            or not isinstance(duration_seconds, int)
+            or duration_seconds <= 0
+        ):
+            raise ValueError("duration_seconds must be a positive integer")
+        if not isinstance(work_zone, str) or not work_zone.strip():
+            raise ValueError("work_zone must be a non-empty string")
+
+        now = datetime.now()
+        duration_minutes = int(round(duration_seconds / 60))
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO work_logs
+                    (date, start_time, duration_minutes, work_zone, duration_seconds)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    now.date().isoformat(),
+                    now.time().isoformat(timespec="seconds"),
+                    duration_minutes,
+                    work_zone.strip(),
+                    duration_seconds,
+                ),
+            )
+
+    def get_focus_guard_rules(self) -> list[FocusGuardRule]:
+        """Return persisted application and active-window block rules."""
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """
+                SELECT id, match_type, pattern, enabled
+                FROM focus_guard_rules
+                ORDER BY id
+                """
+            ).fetchall()
+        return [
+            FocusGuardRule(
+                id=int(row["id"]),
+                match_type=str(row["match_type"]),
+                pattern=str(row["pattern"]),
+                enabled=bool(row["enabled"]),
+            )
+            for row in rows
+        ]
+
+    def save_focus_guard_rules(
+        self,
+        rules: Sequence[tuple[str, str, bool]],
+    ) -> None:
+        """Replace blocked-app/site rules after validating their types and values."""
+        if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
+            raise TypeError("rules must be a sequence of rule tuples")
+        normalized_rules: list[tuple[str, str, int]] = []
+        for rule in rules:
+            if not isinstance(rule, tuple) or len(rule) != 3:
+                raise ValueError("Each rule must contain a type, pattern, and enabled flag")
+            match_type, pattern, enabled = rule
+            if (
+                not isinstance(match_type, str)
+                or match_type not in self.FOCUS_GUARD_MATCH_TYPES
+            ):
+                raise ValueError(f"Unsupported focus-guard match type: {match_type!r}")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError("Focus-guard patterns must not be empty")
+            if not isinstance(enabled, bool):
+                raise TypeError("Rule enabled flags must be bool values")
+            normalized_rules.append((match_type, pattern.strip(), int(enabled)))
+
+        with closing(self._connect()) as connection, connection:
+            connection.execute("DELETE FROM focus_guard_rules")
+            connection.executemany(
+                """
+                INSERT INTO focus_guard_rules (match_type, pattern, enabled)
+                VALUES (?, ?, ?)
+                """,
+                normalized_rules,
+            )
+
+    def get_productivity_summary(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> ProductivitySummary:
+        """Sum recorded work segments and completed timed breaks in a date range."""
+        for value in (start_date, end_date):
+            if value is not None and (
+                not isinstance(value, date) or isinstance(value, datetime)
+            ):
+                raise TypeError("productivity summary dates must be date values")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError("start_date must not be after end_date")
+
+        work_conditions: list[str] = []
+        break_conditions = ["completed_at IS NOT NULL"]
+        work_parameters: list[str] = []
+        break_parameters: list[str] = []
+        if start_date is not None:
+            work_conditions.append("date >= ?")
+            break_conditions.append("date >= ?")
+            work_parameters.append(start_date.isoformat())
+            break_parameters.append(start_date.isoformat())
+        if end_date is not None:
+            work_conditions.append("date <= ?")
+            break_conditions.append("date <= ?")
+            work_parameters.append(end_date.isoformat())
+            break_parameters.append(end_date.isoformat())
+        work_where = (
+            f"WHERE {' AND '.join(work_conditions)}" if work_conditions else ""
+        )
+        break_where = f"WHERE {' AND '.join(break_conditions)}"
+
+        with closing(self._connect()) as connection, connection:
+            work_row = connection.execute(
+                f"""
+                SELECT COALESCE(SUM(duration_seconds), 0)
+                FROM work_logs
+                {work_where}
+                """,
+                work_parameters,
+            ).fetchone()
+            break_row = connection.execute(
+                f"""
+                SELECT COALESCE(SUM(duration_seconds), 0)
+                FROM break_logs
+                {break_where}
+                """,
+                break_parameters,
+            ).fetchone()
+        return ProductivitySummary(
+            work_seconds=int(work_row[0]),
+            break_seconds=int(break_row[0]),
+        )
+
+    def reset_analytics(self, preserve_break_id: int | None = None) -> None:
+        """Clear saved activity, optionally retaining the active timed break."""
+        if preserve_break_id is not None and (
+            isinstance(preserve_break_id, bool)
+            or not isinstance(preserve_break_id, int)
+            or preserve_break_id <= 0
+        ):
+            raise ValueError("preserve_break_id must be a positive integer or None")
+
+        with closing(self._connect()) as connection, connection:
+            connection.execute("DELETE FROM work_logs")
+            if preserve_break_id is None:
+                connection.execute("DELETE FROM break_logs")
+            else:
+                connection.execute(
+                    "DELETE FROM break_logs WHERE id != ?",
+                    (preserve_break_id,),
+                )
 
     def get_todays_total_minutes(self) -> int:
         """Return the total logged work minutes for the current local date."""

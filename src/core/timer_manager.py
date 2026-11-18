@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
 from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
 
 
 class TimerManager:
@@ -46,6 +49,9 @@ class TimerManager:
         self._mode = "idle"
         self._deadline: float | None = None
         self._remaining_when_paused = self._work_interval_sec
+        self._work_elapsed_sec = 0.0
+        self._work_phase_started_at: float | None = None
+        self._last_completed_work_sec = 0.0
         self._pending_events: list[str] = []
 
     @staticmethod
@@ -80,6 +86,20 @@ class TimerManager:
             return self._get_remaining_locked(time.monotonic())
 
     @property
+    def last_completed_work_sec(self) -> float:
+        """Active work seconds in the most recently completed work segment."""
+        with self._condition:
+            return self._last_completed_work_sec
+
+    @property
+    def current_work_elapsed_sec(self) -> float:
+        """Active seconds in the current work segment, excluding pauses."""
+        with self._condition:
+            if self._mode != "work":
+                return 0.0
+            return self._get_work_elapsed_locked(time.monotonic())
+
+    @property
     def is_running(self) -> bool:
         """Whether the timer is actively counting down."""
         with self._condition:
@@ -91,18 +111,27 @@ class TimerManager:
         with self._condition:
             return self._mode == "manual_break"
 
-    def start_work(self) -> None:
-        """Start a work interval or resume the previously paused interval."""
+    def start_work(self, duration_sec: int | float | None = None) -> None:
+        """Start or resume work, optionally setting the preferred focus duration."""
+        if duration_sec is not None:
+            self._validate_interval("duration_sec", duration_sec)
         with self._condition:
             if self._mode not in ("idle", "paused"):
                 if self._mode == "work":
                     return
                 raise RuntimeError(f"Cannot start work while timer is in {self._mode!r} state")
 
+            now = time.monotonic()
+            if duration_sec is not None:
+                self._normal_work_interval_sec = float(duration_sec)
+                if not self._demo_mode:
+                    self._work_interval_sec = float(duration_sec)
             if self._mode == "idle":
                 self._remaining_when_paused = self._work_interval_sec
+                self._work_elapsed_sec = 0.0
             self._mode = "work"
-            self._deadline = time.monotonic() + self._remaining_when_paused
+            self._deadline = now + self._remaining_when_paused
+            self._work_phase_started_at = now
             self._start_thread_locked()
             self._pending_events.append("state")
             self._condition.notify_all()
@@ -116,9 +145,15 @@ class TimerManager:
         with self._condition:
             if self._mode != "work" or self._deadline is None:
                 return
-            self._remaining_when_paused = max(
-                0.0, self._deadline - time.monotonic()
-            )
+            now = time.monotonic()
+            self._remaining_when_paused = max(0.0, self._deadline - now)
+            if self._work_phase_started_at is not None:
+                self._work_elapsed_sec += max(
+                    0.0, now - self._work_phase_started_at
+                )
+            self._last_completed_work_sec = self._work_elapsed_sec
+            self._work_elapsed_sec = 0.0
+            self._work_phase_started_at = None
             self._deadline = None
             self._mode = "paused"
             self._pending_events.append("state")
@@ -130,9 +165,21 @@ class TimerManager:
             self._mode = "idle"
             self._deadline = None
             self._remaining_when_paused = self._work_interval_sec
+            self._work_elapsed_sec = 0.0
+            self._work_phase_started_at = None
+            self._last_completed_work_sec = 0.0
             self._pending_events.clear()
             self._pending_events.append("state")
             self._condition.notify_all()
+
+    def reset_productivity_tracking(self) -> None:
+        """Reset work-time accounting without changing the active countdown."""
+        with self._condition:
+            self._work_elapsed_sec = 0.0
+            self._last_completed_work_sec = 0.0
+            self._work_phase_started_at = (
+                time.monotonic() if self._mode == "work" else None
+            )
 
     def stop(self, timeout: float | None = None) -> None:
         """Stop the background worker and wait up to ``timeout`` seconds."""
@@ -162,8 +209,19 @@ class TimerManager:
             now = time.monotonic()
             if self._mode == "work" and self._deadline is not None:
                 self._remaining_when_paused = max(0.0, self._deadline - now)
+                if self._work_phase_started_at is not None:
+                    self._work_elapsed_sec += max(
+                        0.0, now - self._work_phase_started_at
+                    )
+                self._last_completed_work_sec = self._work_elapsed_sec
+                self._work_elapsed_sec = 0.0
+                self._work_phase_started_at = None
+            elif self._mode == "paused":
+                self._last_completed_work_sec = self._work_elapsed_sec
+                self._work_elapsed_sec = 0.0
             else:
                 self._remaining_when_paused = self._work_interval_sec
+                self._work_elapsed_sec = 0.0
 
             self._mode = "manual_break"
             self._deadline = now + minutes * 60
@@ -191,10 +249,14 @@ class TimerManager:
             now = time.monotonic()
             if self._mode == "work":
                 self._deadline = now + self._work_interval_sec
+                self._work_elapsed_sec = 0.0
+                self._work_phase_started_at = now
             elif self._mode == "break":
                 self._deadline = now + self._break_duration_sec
             elif self._mode in ("idle", "paused", "manual_break"):
                 self._remaining_when_paused = self._work_interval_sec
+                self._work_elapsed_sec = 0.0
+                self._work_phase_started_at = None
             self._condition.notify_all()
 
     def toggle_demo_mode(self, enabled: bool) -> None:
@@ -218,10 +280,14 @@ class TimerManager:
             now = time.monotonic()
             if self._mode == "work":
                 self._deadline = now + self._work_interval_sec
+                self._work_elapsed_sec = 0.0
+                self._work_phase_started_at = now
             elif self._mode == "break":
                 self._deadline = now + self._break_duration_sec
             elif self._mode in ("idle", "paused", "manual_break"):
                 self._remaining_when_paused = self._work_interval_sec
+                self._work_elapsed_sec = 0.0
+                self._work_phase_started_at = None
             self._condition.notify_all()
 
     def _start_thread_locked(self) -> None:
@@ -263,16 +329,24 @@ class TimerManager:
                         time_left = self._deadline - now
                         if time_left <= 0:
                             if self._mode == "work":
+                                self._last_completed_work_sec = (
+                                    self._get_work_elapsed_locked(now)
+                                )
+                                self._work_elapsed_sec = 0.0
+                                self._work_phase_started_at = None
                                 self._mode = "break"
                                 self._deadline = now + self._break_duration_sec
                                 event = "break_start"
                             elif self._mode == "break":
                                 self._mode = "work"
                                 self._remaining_when_paused = self._work_interval_sec
+                                self._work_elapsed_sec = 0.0
+                                self._work_phase_started_at = now
                                 self._deadline = now + self._work_interval_sec
                                 event = "break_end"
                             else:
                                 self._mode = "work"
+                                self._work_phase_started_at = now
                                 self._deadline = now + self._remaining_when_paused
                                 event = "break_end"
                             last_tick = None
@@ -290,20 +364,29 @@ class TimerManager:
 
                         self._condition.wait(timeout=min(1.0, time_left))
 
-                if self.on_state_update is not None:
-                    self.on_state_update(state, remaining)
+                self._notify(self.on_state_update, "state update", state, remaining)
                 if event == "tick":
-                    if self.on_tick is not None:
-                        self.on_tick(remaining)
+                    self._notify(self.on_tick, "tick", remaining)
                 elif event == "break_start":
-                    if self.on_break_start is not None:
-                        self.on_break_start()
+                    self._notify(self.on_break_start, "break start")
                 elif event == "break_end":
-                    if self.on_break_end is not None:
-                        self.on_break_end()
+                    self._notify(self.on_break_end, "break end")
         finally:
             with self._condition:
                 self._condition.notify_all()
+
+    @staticmethod
+    def _notify(
+        callback: Callable[..., None] | None,
+        callback_name: str,
+        *args: object,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            logger.exception("MindShield timer %s callback failed", callback_name)
 
     def _get_remaining_locked(self, now: float) -> int:
         if self._deadline is not None:
@@ -311,3 +394,9 @@ class TimerManager:
         if self._mode in ("idle", "paused"):
             return max(0, math.ceil(self._remaining_when_paused))
         return 0
+
+    def _get_work_elapsed_locked(self, now: float) -> float:
+        elapsed = self._work_elapsed_sec
+        if self._work_phase_started_at is not None:
+            elapsed += max(0.0, now - self._work_phase_started_at)
+        return elapsed
