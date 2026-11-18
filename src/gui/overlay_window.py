@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 import tkinter as tk
+from collections.abc import Callable
 
 import customtkinter as ctk
 
@@ -30,6 +31,8 @@ class OverlayWindow(ctk.CTkToplevel):
         break_duration_sec: int = 20,
         mode: str = "overlay",
         message: str = MESSAGE,
+        on_pause: Callable[[], None] | None = None,
+        on_return_to_work: Callable[[], None] | None = None,
     ) -> None:
         if isinstance(break_duration_sec, bool) or not isinstance(break_duration_sec, int):
             raise TypeError("break_duration_sec must be an integer")
@@ -45,6 +48,9 @@ class OverlayWindow(ctk.CTkToplevel):
         self._deadline = time.monotonic() + break_duration_sec
         self._after_id: str | None = None
         self._fade_after_id: str | None = None
+        self._on_pause = on_pause
+        self._on_return_to_work = on_return_to_work
+        self._paused = False
         self._target_alpha = 0.84 if mode == "overlay" else 0.94
         self._fading_out = False
 
@@ -59,7 +65,7 @@ class OverlayWindow(ctk.CTkToplevel):
             width, height = screen_width, screen_height
             x = y = 0
         else:
-            width, height = min(420, screen_width), min(190, screen_height)
+            width, height = min(420, screen_width), min(280, screen_height)
             x = max(0, screen_width - width - 24)
             y = max(0, screen_height - height - 48)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -83,7 +89,60 @@ class OverlayWindow(ctk.CTkToplevel):
         )
         self.countdown_label.pack(pady=(0, 24))
 
+        actions = ctk.CTkFrame(content, fg_color="transparent")
+        actions.pack(fill="x", padx=24, pady=(0, 20))
+        self.pause_button = ctk.CTkButton(
+            actions,
+            text="Pause Break",
+            command=self._request_pause,
+            fg_color=COLORS["control"],
+            hover_color=COLORS["control_hover"],
+        )
+        self.pause_button.pack(side="left", expand=True, fill="x", padx=(0, 8))
+        self.return_button = ctk.CTkButton(
+            actions,
+            text="Back to Work",
+            command=self._request_return_to_work,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+        )
+        self.return_button.pack(side="left", expand=True, fill="x", padx=(8, 0))
+
         self._fade_in()
+        self._update_countdown()
+
+    def _request_pause(self) -> None:
+        if self._on_pause is not None:
+            self._on_pause()
+
+    def _request_return_to_work(self) -> None:
+        if self._on_return_to_work is not None:
+            self._on_return_to_work()
+
+    def set_paused(self, paused: bool) -> None:
+        """Synchronize the reminder countdown with the main break timer."""
+        if self._paused == paused:
+            return
+        self._paused = paused
+        if paused:
+            self._remaining_seconds = max(
+                0,
+                math.ceil(self._deadline - time.monotonic()),
+            )
+            if self._after_id is not None:
+                try:
+                    self.after_cancel(self._after_id)
+                except tk.TclError:
+                    pass
+                self._after_id = None
+            self.countdown_label.configure(
+                text=f"Break paused — {self._remaining_seconds} seconds remaining"
+            )
+            self.pause_button.configure(text="Resume Break")
+            return
+
+        self._deadline = time.monotonic() + self._remaining_seconds
+        self.pause_button.configure(text="Pause Break")
         self._update_countdown()
 
     def _fade_in(self, step: int = 0) -> None:
@@ -102,6 +161,8 @@ class OverlayWindow(ctk.CTkToplevel):
         self._fade_after_id = self.after(20, self._fade_out, step + 1)
 
     def _update_countdown(self) -> None:
+        if self._paused:
+            return
         remaining = max(0, math.ceil(self._deadline - time.monotonic()))
         self._remaining_seconds = remaining
         unit = "second" if remaining == 1 else "seconds"

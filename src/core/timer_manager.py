@@ -29,6 +29,7 @@ class TimerManager:
         on_break_start: Callable[[], None] | None = None,
         on_break_end: Callable[[], None] | None = None,
         on_state_update: Callable[[str, int], None] | None = None,
+        on_break_end_early: Callable[[], None] | None = None,
     ) -> None:
         self._validate_interval("work_interval_sec", work_interval_sec)
         self._validate_interval("break_duration_sec", break_duration_sec)
@@ -41,6 +42,7 @@ class TimerManager:
         self.on_break_start = on_break_start
         self.on_break_end = on_break_end
         self.on_state_update = on_state_update
+        self.on_break_end_early = on_break_end_early
 
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -49,6 +51,8 @@ class TimerManager:
         self._mode = "idle"
         self._deadline: float | None = None
         self._remaining_when_paused = self._work_interval_sec
+        self._break_remaining_when_paused = self._break_duration_sec
+        self._paused_break_mode: str | None = None
         self._work_elapsed_sec = 0.0
         self._work_phase_started_at: float | None = None
         self._last_completed_work_sec = 0.0
@@ -63,7 +67,7 @@ class TimerManager:
 
     @property
     def state(self) -> str:
-        """Current timer phase: idle, work, break, manual_break, or paused."""
+        """Current phase, including paused work and paused break states."""
         with self._condition:
             return self._mode
 
@@ -109,7 +113,10 @@ class TimerManager:
     def is_on_manual_break(self) -> bool:
         """Whether a timed manual break is currently in progress."""
         with self._condition:
-            return self._mode == "manual_break"
+            return self._mode == "manual_break" or (
+                self._mode == "break_paused"
+                and self._paused_break_mode == "manual_break"
+            )
 
     def start_work(self, duration_sec: int | float | None = None) -> None:
         """Start or resume work, optionally setting the preferred focus duration."""
@@ -159,12 +166,65 @@ class TimerManager:
             self._pending_events.append("state")
             self._condition.notify_all()
 
+    def pause_break(self) -> None:
+        """Pause a timed break while preserving its type and remaining time."""
+        with self._condition:
+            if self._mode not in ("break", "manual_break") or self._deadline is None:
+                return
+            now = time.monotonic()
+            self._break_remaining_when_paused = max(0.0, self._deadline - now)
+            self._paused_break_mode = self._mode
+            self._deadline = None
+            self._mode = "break_paused"
+            self._pending_events.append("state")
+            self._condition.notify_all()
+
+    def resume_break(self) -> None:
+        """Resume a paused break with its saved remaining duration."""
+        with self._condition:
+            if self._mode != "break_paused" or self._paused_break_mode is None:
+                return
+            self._mode = self._paused_break_mode
+            self._paused_break_mode = None
+            self._deadline = time.monotonic() + self._break_remaining_when_paused
+            self._pending_events.append("state")
+            self._condition.notify_all()
+
+    def return_to_work(self) -> bool:
+        """End a break early and resume the appropriate focus countdown."""
+        with self._condition:
+            if self._mode in ("break", "manual_break"):
+                break_mode = self._mode
+            elif self._mode == "break_paused":
+                break_mode = self._paused_break_mode
+            else:
+                return False
+            if break_mode not in ("break", "manual_break"):
+                return False
+
+            now = time.monotonic()
+            self._remaining_when_paused = (
+                self._remaining_when_paused
+                if break_mode == "manual_break"
+                else self._work_interval_sec
+            )
+            self._work_elapsed_sec = 0.0
+            self._work_phase_started_at = now
+            self._deadline = now + self._remaining_when_paused
+            self._mode = "work"
+            self._paused_break_mode = None
+            self._pending_events.append("break_end_early")
+            self._condition.notify_all()
+            return True
+
     def reset_timer(self) -> None:
         """Stop the current phase and reset the work countdown to its interval."""
         with self._condition:
             self._mode = "idle"
             self._deadline = None
             self._remaining_when_paused = self._work_interval_sec
+            self._break_remaining_when_paused = self._break_duration_sec
+            self._paused_break_mode = None
             self._work_elapsed_sec = 0.0
             self._work_phase_started_at = None
             self._last_completed_work_sec = 0.0
@@ -203,7 +263,7 @@ class TimerManager:
             raise ValueError("minutes must be greater than zero")
 
         with self._condition:
-            if self._mode in ("break", "manual_break"):
+            if self._mode in ("break", "manual_break", "break_paused"):
                 raise RuntimeError("A break is already in progress")
 
             now = time.monotonic()
@@ -253,7 +313,7 @@ class TimerManager:
                 self._work_phase_started_at = now
             elif self._mode == "break":
                 self._deadline = now + self._break_duration_sec
-            elif self._mode in ("idle", "paused", "manual_break"):
+            elif self._mode in ("idle", "paused", "manual_break", "break_paused"):
                 self._remaining_when_paused = self._work_interval_sec
                 self._work_elapsed_sec = 0.0
                 self._work_phase_started_at = None
@@ -284,7 +344,7 @@ class TimerManager:
                 self._work_phase_started_at = now
             elif self._mode == "break":
                 self._deadline = now + self._break_duration_sec
-            elif self._mode in ("idle", "paused", "manual_break"):
+            elif self._mode in ("idle", "paused", "manual_break", "break_paused"):
                 self._remaining_when_paused = self._work_interval_sec
                 self._work_elapsed_sec = 0.0
                 self._work_phase_started_at = None
@@ -321,7 +381,7 @@ class TimerManager:
                             remaining = self._get_remaining_locked(time.monotonic())
                             break
 
-                        if self._mode in ("idle", "paused") or self._deadline is None:
+                        if self._mode in ("idle", "paused", "break_paused") or self._deadline is None:
                             self._condition.wait()
                             continue
 
@@ -371,6 +431,11 @@ class TimerManager:
                     self._notify(self.on_break_start, "break start")
                 elif event == "break_end":
                     self._notify(self.on_break_end, "break end")
+                elif event == "break_end_early":
+                    self._notify(
+                        self.on_break_end_early,
+                        "early break end",
+                    )
         finally:
             with self._condition:
                 self._condition.notify_all()
@@ -391,6 +456,8 @@ class TimerManager:
     def _get_remaining_locked(self, now: float) -> int:
         if self._deadline is not None:
             return max(0, math.ceil(self._deadline - now))
+        if self._mode == "break_paused":
+            return max(0, math.ceil(self._break_remaining_when_paused))
         if self._mode in ("idle", "paused"):
             return max(0, math.ceil(self._remaining_when_paused))
         return 0

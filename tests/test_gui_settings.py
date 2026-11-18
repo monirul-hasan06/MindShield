@@ -1,6 +1,7 @@
+import sqlite3
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from src.gui.main_window import MainWindow
 
@@ -55,6 +56,45 @@ class EyeCareSettingsTests(unittest.TestCase):
 
         window.database.set_settings.assert_not_called()
         window.timer_manager.configure_intervals.assert_not_called()
+        window.status_label.configure.assert_called_once()
+
+
+class AppearanceSettingsTests(unittest.TestCase):
+    def _window(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            database=Mock(),
+            appearance_menu=Mock(),
+            dashboard_appearance_menu=Mock(),
+            _appearance_mode="dark",
+            _appearance_label=Mock(return_value="Dark"),
+            status_label=Mock(),
+        )
+
+    def test_saves_and_synchronizes_dashboard_and_settings_themes(self) -> None:
+        window = self._window()
+
+        with patch("src.gui.main_window.ctk.set_appearance_mode") as set_appearance:
+            MainWindow._save_appearance_mode(window, "Light")
+
+        window.database.set_settings.assert_called_once_with(
+            {"appearance_mode": "light"}
+        )
+        self.assertEqual(window._appearance_mode, "light")
+        window.appearance_menu.set.assert_called_once_with("Light")
+        window.dashboard_appearance_menu.set.assert_called_once_with("Light")
+        set_appearance.assert_called_once_with("light")
+
+    def test_failed_theme_save_restores_both_menus(self) -> None:
+        window = self._window()
+        window.database.set_settings.side_effect = sqlite3.Error("database unavailable")
+
+        with patch("src.gui.main_window.ctk.set_appearance_mode") as set_appearance:
+            MainWindow._save_appearance_mode(window, "Light")
+
+        self.assertEqual(window._appearance_mode, "dark")
+        window.appearance_menu.set.assert_called_once_with("Dark")
+        window.dashboard_appearance_menu.set.assert_called_once_with("Dark")
+        set_appearance.assert_not_called()
         window.status_label.configure.assert_called_once()
 
 

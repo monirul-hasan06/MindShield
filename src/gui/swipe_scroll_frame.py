@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import tkinter as tk
 import weakref
 
@@ -13,6 +14,8 @@ from src.gui.theme import COLORS
 
 class _SwipeGestureManager:
     """Route pointer drags to the nearest scrollable frame."""
+
+    SCROLL_ANIMATION_DURATION_SEC = 0.18
 
     INTERACTIVE_WIDGET_TYPES = (
         ctk.CTkButton,
@@ -33,6 +36,9 @@ class _SwipeGestureManager:
         ] = weakref.WeakKeyDictionary()
         self._scroll_after_ids: weakref.WeakKeyDictionary[
             SwipeScrollableFrame, str
+        ] = weakref.WeakKeyDictionary()
+        self._scroll_animation_origins: weakref.WeakKeyDictionary[
+            SwipeScrollableFrame, tuple[float, float]
         ] = weakref.WeakKeyDictionary()
         root.bind_all("<ButtonPress-1>", self._on_press, add="+")
         root.bind_all("<B1-Motion>", self._on_drag, add="+")
@@ -145,6 +151,7 @@ class _SwipeGestureManager:
 
         self._scroll_targets[frame] = target
         if frame not in self._scroll_after_ids:
+            self._scroll_animation_origins[frame] = (first, time.monotonic())
             self._scroll_step(frame)
         return True
 
@@ -156,23 +163,43 @@ class _SwipeGestureManager:
             except tk.TclError:
                 pass
         self._scroll_targets.pop(frame, None)
+        self._scroll_animation_origins.pop(frame, None)
 
     def _scroll_step(self, frame: SwipeScrollableFrame) -> None:
         self._scroll_after_ids.pop(frame, None)
         if not frame.winfo_exists():
             self._scroll_targets.pop(frame, None)
+            self._scroll_animation_origins.pop(frame, None)
             return
 
         canvas = frame._parent_canvas
-        first, _last = canvas.yview()
+        first, last = canvas.yview()
         target = self._scroll_targets.get(frame, first)
-        distance = target - first
-        if abs(distance) < 0.001:
+        maximum = max(0.0, 1.0 - (last - first))
+        target = min(maximum, max(0.0, target))
+        origin = self._scroll_animation_origins.get(frame)
+        if origin is None:
+            origin = (first, time.monotonic())
+            self._scroll_animation_origins[frame] = origin
+
+        start, started_at = origin
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (time.monotonic() - started_at)
+                / self.SCROLL_ANIMATION_DURATION_SEC,
+            ),
+        )
+        eased_progress = 1.0 - (1.0 - progress) ** 3
+        position = start + (target - start) * eased_progress
+        canvas.yview_moveto(position)
+        if progress >= 1.0:
             canvas.yview_moveto(target)
             self._scroll_targets.pop(frame, None)
+            self._scroll_animation_origins.pop(frame, None)
             return
 
-        canvas.yview_moveto(first + distance * 0.28)
         after_id = self.root.after(16, self._scroll_step, frame)
         self._scroll_after_ids[frame] = after_id
 

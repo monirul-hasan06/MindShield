@@ -66,6 +66,101 @@ class TimerManagerTests(unittest.TestCase):
         finally:
             timer.stop(timeout=2)
 
+    def test_pause_and_resume_preserve_manual_break_countdown(self) -> None:
+        break_started = threading.Event()
+        timer = TimerManager(
+            work_interval_sec=30,
+            break_duration_sec=5,
+            on_break_start=break_started.set,
+        )
+        try:
+            timer.start_manual_break(1)
+            self.assertTrue(break_started.wait(2))
+            timer.pause_break()
+            paused_remaining = timer.remaining_sec
+            time.sleep(0.03)
+
+            self.assertEqual(timer.state, "break_paused")
+            self.assertTrue(timer.is_on_manual_break)
+            self.assertEqual(timer.remaining_sec, paused_remaining)
+
+            timer.resume_break()
+            self.assertEqual(timer.state, "manual_break")
+            self.assertLessEqual(timer.remaining_sec, paused_remaining)
+        finally:
+            timer.stop(timeout=2)
+
+    def test_pause_and_resume_preserve_scheduled_break_countdown(self) -> None:
+        break_started = threading.Event()
+        timer = TimerManager(
+            work_interval_sec=0.05,
+            break_duration_sec=5,
+            on_break_start=break_started.set,
+        )
+        try:
+            timer.start_work()
+            self.assertTrue(break_started.wait(2))
+            timer.pause_break()
+            paused_remaining = timer.remaining_sec
+            time.sleep(0.03)
+
+            self.assertEqual(timer.state, "break_paused")
+            self.assertFalse(timer.is_on_manual_break)
+            self.assertEqual(timer.remaining_sec, paused_remaining)
+
+            timer.resume_break()
+            self.assertEqual(timer.state, "break")
+            self.assertLessEqual(timer.remaining_sec, paused_remaining)
+        finally:
+            timer.stop(timeout=2)
+
+    def test_ending_manual_break_early_resumes_saved_focus_time(self) -> None:
+        early_end = threading.Event()
+        completed = threading.Event()
+        break_started = threading.Event()
+        timer = TimerManager(
+            work_interval_sec=30,
+            break_duration_sec=5,
+            on_break_start=break_started.set,
+            on_break_end=completed.set,
+            on_break_end_early=early_end.set,
+        )
+        try:
+            timer.start_work()
+            time.sleep(0.03)
+            saved_remaining = timer.remaining_sec
+            timer.start_manual_break(1)
+            self.assertTrue(break_started.wait(2))
+
+            self.assertTrue(timer.return_to_work())
+            self.assertTrue(early_end.wait(2))
+            self.assertEqual(timer.state, "work")
+            self.assertLessEqual(timer.remaining_sec, saved_remaining)
+            self.assertGreaterEqual(timer.remaining_sec, saved_remaining - 1)
+            self.assertFalse(completed.is_set())
+        finally:
+            timer.stop(timeout=2)
+
+    def test_ending_scheduled_break_early_starts_a_fresh_focus_interval(self) -> None:
+        early_end = threading.Event()
+        break_started = threading.Event()
+        timer = TimerManager(
+            work_interval_sec=1,
+            break_duration_sec=5,
+            on_break_start=break_started.set,
+            on_break_end_early=early_end.set,
+        )
+        try:
+            timer.start_work()
+            self.assertTrue(break_started.wait(2))
+
+            self.assertTrue(timer.return_to_work())
+            self.assertTrue(early_end.wait(2))
+            self.assertEqual(timer.state, "work")
+            self.assertGreaterEqual(timer.remaining_sec, 1)
+        finally:
+            timer.stop(timeout=2)
+
     def test_work_and_break_phases_repeat(self) -> None:
         break_started = threading.Event()
         break_ended = threading.Event()

@@ -199,6 +199,7 @@ class MainWindow(ctk.CTk):
         self.timer_manager.on_tick = self._on_timer_tick
         self.timer_manager.on_break_start = self._on_break_start
         self.timer_manager.on_break_end = self._on_break_end
+        self.timer_manager.on_break_end_early = self._on_break_end_early
         self.timer_manager.on_state_update = self._on_timer_state_update
 
         self.focus_app_controller = FocusAppController()
@@ -291,6 +292,16 @@ class MainWindow(ctk.CTk):
         self._build_analytics()
         self._build_settings()
 
+    def _appearance_label(self) -> str:
+        return next(
+            (
+                label
+                for label, mode in APPEARANCE_MODES.items()
+                if mode == self._appearance_mode
+            ),
+            "Dark",
+        )
+
     def _build_dashboard(self) -> None:
         tab = SwipeScrollableFrame(
             self.dashboard_tab,
@@ -311,6 +322,23 @@ class MainWindow(ctk.CTk):
             text_color=COLORS["text_primary"],
         )
         self.greeting_label.pack(pady=(18, 8))
+        theme_row = ctk.CTkFrame(focus_card, fg_color="transparent")
+        theme_row.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkLabel(
+            theme_row,
+            text="Dashboard theme",
+            text_color=COLORS["text_secondary"],
+        ).pack(side="left")
+        self.dashboard_appearance_menu = ctk.CTkOptionMenu(
+            theme_row,
+            values=list(APPEARANCE_MODES),
+            command=self._save_appearance_mode,
+            width=120,
+            fg_color=COLORS["control"],
+            button_color=COLORS["control_hover"],
+        )
+        self.dashboard_appearance_menu.set(self._appearance_label())
+        self.dashboard_appearance_menu.pack(side="right")
         self.phase_label = ctk.CTkLabel(
             focus_card,
             text="FOCUS SESSION",
@@ -929,14 +957,6 @@ class MainWindow(ctk.CTk):
             text="Theme",
             text_color=COLORS["text_secondary"],
         ).grid(row=1, column=0, sticky="w", padx=18, pady=8)
-        appearance_label = next(
-            (
-                label
-                for label, mode in APPEARANCE_MODES.items()
-                if mode == self._appearance_mode
-            ),
-            "Dark",
-        )
         self.appearance_menu = ctk.CTkOptionMenu(
             appearance_card,
             values=list(APPEARANCE_MODES),
@@ -944,7 +964,7 @@ class MainWindow(ctk.CTk):
             fg_color=COLORS["control"],
             button_color=COLORS["control_hover"],
         )
-        self.appearance_menu.set(appearance_label)
+        self.appearance_menu.set(self._appearance_label())
         self.appearance_menu.grid(row=1, column=1, sticky="e", padx=18, pady=8)
         ctk.CTkLabel(
             appearance_card,
@@ -1359,7 +1379,14 @@ class MainWindow(ctk.CTk):
         self.status_label.configure(text=status_message)
 
     def _toggle_work_pause(self) -> None:
-        if self.timer_manager.state == "work":
+        state = self.timer_manager.state
+        if state in ("break", "manual_break"):
+            self.timer_manager.pause_break()
+            return
+        if state == "break_paused":
+            self.timer_manager.resume_break()
+            return
+        if state == "work":
             self.timer_manager.pause_work()
             self.window_tracker.set_manual_break(True)
             elapsed_seconds = int(round(self.timer_manager.last_completed_work_sec))
@@ -1425,6 +1452,10 @@ class MainWindow(ctk.CTk):
         self._manual_break_duration_seconds = minutes * 60
         self._work_started = True
         self.status_label.configure(text=f"Break started for {minutes} minutes.")
+
+    def _return_to_work_early(self) -> None:
+        if not self.timer_manager.return_to_work():
+            self.status_label.configure(text="There is no active break to end.")
 
     def _activate_work_zone_profile(self, profile_name: str) -> None:
         profile = next(
@@ -2266,33 +2297,22 @@ class MainWindow(ctk.CTk):
     def _save_appearance_mode(self, label: str) -> None:
         mode = APPEARANCE_MODES.get(label)
         if mode is None:
-            self.appearance_menu.set(
-                next(
-                    (
-                        option
-                        for option, value in APPEARANCE_MODES.items()
-                        if value == self._appearance_mode
-                    ),
-                    "Dark",
-                )
-            )
+            self.appearance_menu.set(self._appearance_label())
+            self.dashboard_appearance_menu.set(self._appearance_label())
             self.status_label.configure(text="Choose a supported appearance mode.")
             return
 
         try:
             self.database.set_settings({"appearance_mode": mode})
         except sqlite3.Error as error:
-            self.appearance_menu.set(
-                next(
-                    option
-                    for option, value in APPEARANCE_MODES.items()
-                    if value == self._appearance_mode
-                )
-            )
+            self.appearance_menu.set(self._appearance_label())
+            self.dashboard_appearance_menu.set(self._appearance_label())
             self.status_label.configure(text=f"Could not save appearance mode: {error}")
             return
 
         self._appearance_mode = mode
+        self.appearance_menu.set(label)
+        self.dashboard_appearance_menu.set(label)
         ctk.set_appearance_mode(mode)
         self.status_label.configure(text=f"Appearance set to {label}.")
 
@@ -2360,6 +2380,7 @@ class MainWindow(ctk.CTk):
             "paused": "WORK PAUSED",
             "break": "SHORT BREAK",
             "manual_break": "MANUAL BREAK",
+            "break_paused": "BREAK PAUSED",
         }
         phase_colors = {
             "idle": COLORS["highlight"],
@@ -2367,6 +2388,7 @@ class MainWindow(ctk.CTk):
             "paused": COLORS["text_muted"],
             "break": COLORS["success"],
             "manual_break": COLORS["success"],
+            "break_paused": COLORS["success"],
         }
         self.phase_label.configure(
             text=phase_labels.get(state, "FOCUS SESSION"),
@@ -2375,7 +2397,7 @@ class MainWindow(ctk.CTk):
         self.timer_progress.configure(
             progress_color=(
                 COLORS["success"]
-                if state in ("break", "manual_break")
+                if state in ("break", "manual_break", "break_paused")
                 else COLORS["accent"]
             )
         )
@@ -2385,17 +2407,41 @@ class MainWindow(ctk.CTk):
             "paused": "Work Paused",
             "break": "Break in Progress",
             "manual_break": "Break in Progress",
+            "break_paused": "Break Paused",
         }
         self.start_button.configure(
             state="normal" if state == "idle" else "disabled",
             text=start_text.get(state, "Start Work"),
         )
         self.pause_button.configure(
-            state="normal" if state in ("work", "paused") else "disabled",
-            text="Resume Work" if state == "paused" else "Pause Work",
+            state=(
+                "normal"
+                if state in ("work", "paused", "break", "manual_break", "break_paused")
+                else "disabled"
+            ),
+            text={
+                "paused": "Resume Work",
+                "break": "Pause Break",
+                "manual_break": "Pause Break",
+                "break_paused": "Resume Break",
+            }.get(state, "Pause Work"),
         )
         self.stop_button.configure(
-            state="normal" if state in ("work", "paused") else "disabled"
+            state=(
+                "normal"
+                if state in ("work", "paused", "break", "manual_break", "break_paused")
+                else "disabled"
+            ),
+            text=(
+                "Back to Work"
+                if state in ("break", "manual_break", "break_paused")
+                else "Stop Work"
+            ),
+            command=(
+                self._return_to_work_early
+                if state in ("break", "manual_break", "break_paused")
+                else self._stop_work
+            ),
         )
         messages = {
             "idle": "Ready when you are.",
@@ -2403,8 +2449,11 @@ class MainWindow(ctk.CTk):
             "paused": "Work paused.",
             "break": "Break time.",
             "manual_break": "Manual break in progress.",
+            "break_paused": "Break paused.",
         }
         self.status_label.configure(text=messages.get(state, f"Timer state: {state}."))
+        if self._overlay is not None and self._overlay.winfo_exists():
+            self._overlay.set_paused(state == "break_paused")
         self._update_countdown(remaining_seconds)
 
     def _update_countdown(self, remaining_seconds: int) -> None:
@@ -2421,6 +2470,11 @@ class MainWindow(ctk.CTk):
             "paused": self.timer_manager.work_interval_sec,
             "break": self.timer_manager.break_duration_sec,
             "manual_break": self._manual_break_duration_seconds,
+            "break_paused": (
+                self._manual_break_duration_seconds
+                if self.timer_manager.is_on_manual_break
+                else self.timer_manager.break_duration_sec
+            ),
         }.get(state, 0)
         progress = (
             min(1.0, total_seconds / phase_duration)
@@ -2502,9 +2556,17 @@ class MainWindow(ctk.CTk):
             duration,
             mode=self._break_overlay_mode,
             message=message,
+            on_pause=self._toggle_work_pause,
+            on_return_to_work=self._return_to_work_early,
         )
 
     def _on_break_end(self) -> None:
+        self._finish_break(completed=True)
+
+    def _on_break_end_early(self) -> None:
+        self._finish_break(completed=False)
+
+    def _finish_break(self, completed: bool) -> None:
         self.window_tracker.set_manual_break(False)
         if (
             not self._closing
@@ -2523,14 +2585,12 @@ class MainWindow(ctk.CTk):
             with self._activity_data_lock:
                 break_id = self._scheduled_break_id
                 self._scheduled_break_id = None
-                if break_id is not None:
+                if completed and break_id is not None:
                     self.database.complete_scheduled_break(break_id)
             if break_id is not None and not self._closing:
                 self.after(0, self._refresh_analytics)
         except (OSError, sqlite3.Error, RuntimeError, ValueError) as error:
-            self._report_background_error(
-                f"Could not save completed break: {error}"
-            )
+            self._report_background_error(f"Could not save break status: {error}")
         if not self._closing:
             self.after(0, self._close_break_overlay)
             self.after(0, self._return_to_work_app)
