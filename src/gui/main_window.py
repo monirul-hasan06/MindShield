@@ -24,6 +24,7 @@ from src.database.db_handler import (
 )
 from src.gui.overlay_window import OverlayWindow
 from src.gui.swipe_scroll_frame import SwipeScrollableFrame
+from src.gui.themed_controls import themed_button, themed_option_menu
 from src.gui.theme import APPEARANCE_MODES, COLORS, TEXT_SIZE_SCALING
 
 
@@ -280,8 +281,12 @@ class MainWindow(ctk.CTk):
             self,
             fg_color=COLORS["tab_background"],
             segmented_button_fg_color=COLORS["segment_background"],
-            segmented_button_selected_color=COLORS["accent"],
-            segmented_button_selected_hover_color=COLORS["accent_hover"],
+            segmented_button_selected_color=COLORS["segment_selected"],
+            segmented_button_selected_hover_color=COLORS["segment_selected_hover"],
+            segmented_button_unselected_color=COLORS["segment_background"],
+            segmented_button_unselected_hover_color=COLORS["control_hover"],
+            text_color=COLORS["text_primary"],
+            text_color_disabled=COLORS["text_primary"],
         )
         self.tabs.grid(row=1, column=0, sticky="nsew", padx=24, pady=(8, 24))
         self.dashboard_tab = self.tabs.add("Dashboard")
@@ -322,15 +327,8 @@ class MainWindow(ctk.CTk):
             text_color=COLORS["text_primary"],
         )
         self.greeting_label.pack(pady=(18, 8))
-        theme_row = ctk.CTkFrame(focus_card, fg_color="transparent")
-        theme_row.pack(fill="x", padx=18, pady=(0, 8))
-        ctk.CTkLabel(
-            theme_row,
-            text="Dashboard theme",
-            text_color=COLORS["text_secondary"],
-        ).pack(side="left")
-        self.dashboard_appearance_menu = ctk.CTkOptionMenu(
-            theme_row,
+        self.dashboard_appearance_menu = themed_option_menu(
+            focus_card,
             values=list(APPEARANCE_MODES),
             command=self._save_appearance_mode,
             width=120,
@@ -338,7 +336,11 @@ class MainWindow(ctk.CTk):
             button_color=COLORS["control_hover"],
         )
         self.dashboard_appearance_menu.set(self._appearance_label())
-        self.dashboard_appearance_menu.pack(side="right")
+        self.dashboard_appearance_menu.pack(
+            anchor="e",
+            padx=18,
+            pady=(0, 8),
+        )
         self.phase_label = ctk.CTkLabel(
             focus_card,
             text="FOCUS SESSION",
@@ -400,7 +402,7 @@ class MainWindow(ctk.CTk):
         controls = ctk.CTkFrame(tab, fg_color="transparent")
         controls.grid(row=1, column=0, sticky="ew", padx=24, pady=10)
         controls.grid_columnconfigure((0, 1), weight=1)
-        self.start_button = ctk.CTkButton(
+        self.start_button = themed_button(
             controls,
             text="Start Work",
             height=42,
@@ -409,7 +411,7 @@ class MainWindow(ctk.CTk):
             command=self._start_work,
         )
         self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self.pause_button = ctk.CTkButton(
+        self.pause_button = themed_button(
             controls,
             text="Pause Work",
             height=38,
@@ -421,7 +423,7 @@ class MainWindow(ctk.CTk):
         self.pause_button.grid(
             row=1, column=0, sticky="ew", padx=(0, 8), pady=(10, 0)
         )
-        self.stop_button = ctk.CTkButton(
+        self.stop_button = themed_button(
             controls,
             text="Stop Work",
             height=38,
@@ -437,7 +439,7 @@ class MainWindow(ctk.CTk):
         break_controls = ctk.CTkFrame(controls, fg_color="transparent")
         break_controls.grid(row=0, column=1, sticky="ew", padx=(8, 0))
         break_controls.grid_columnconfigure(0, weight=1)
-        self.break_length_menu = ctk.CTkOptionMenu(
+        self.break_length_menu = themed_option_menu(
             break_controls,
             values=["5", "10", "15"],
             width=90,
@@ -446,7 +448,7 @@ class MainWindow(ctk.CTk):
         )
         self.break_length_menu.set("5")
         self.break_length_menu.grid(row=0, column=0, sticky="e", padx=(0, 8))
-        self.break_button = ctk.CTkButton(
+        self.break_button = themed_button(
             break_controls,
             text="Take a Break",
             height=42,
@@ -484,7 +486,7 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=17, weight="bold"),
             text_color=COLORS["text_primary"],
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(16, 10))
-        self.work_zone_selector = ctk.CTkOptionMenu(
+        self.work_zone_selector = themed_option_menu(
             zone_card,
             values=[profile.name for profile in self._work_zone_profiles],
             height=38,
@@ -496,7 +498,7 @@ class MainWindow(ctk.CTk):
         self.work_zone_selector.grid(
             row=1, column=0, sticky="ew", padx=(18, 10), pady=(0, 16)
         )
-        ctk.CTkButton(
+        themed_button(
             zone_card,
             text="Edit Profiles",
             command=lambda: self.tabs.set("Settings"),
@@ -591,7 +593,7 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=COLORS["text_primary"],
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(18, 8))
-        self.history_range_menu = ctk.CTkOptionMenu(
+        self.history_range_menu = themed_option_menu(
             history_card,
             values=["Last 7 days", "Last 30 days", "All history"],
             command=lambda _value: self._refresh_session_history(),
@@ -612,7 +614,7 @@ class MainWindow(ctk.CTk):
         self.history_search_entry.bind(
             "<Return>", lambda _event: self._refresh_session_history()
         )
-        ctk.CTkButton(
+        themed_button(
             history_card,
             text="Search",
             command=self._refresh_session_history,
@@ -630,7 +632,7 @@ class MainWindow(ctk.CTk):
         self.session_history_text.grid(
             row=2, column=0, columnspan=3, sticky="ew", padx=20, pady=8
         )
-        ctk.CTkButton(
+        themed_button(
             history_card,
             text="Export Filtered History to CSV",
             command=self._export_session_history,
@@ -655,7 +657,7 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=COLORS["text_primary"],
         ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 8))
-        self.productivity_range_menu = ctk.CTkOptionMenu(
+        self.productivity_range_menu = themed_option_menu(
             productivity_card,
             values=["Last 7 days", "Last 30 days", "All history"],
             command=lambda _value: self._refresh_productivity_profile(),
@@ -725,7 +727,7 @@ class MainWindow(ctk.CTk):
             wraplength=560,
             text_color=COLORS["text_muted"],
         ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
-        ctk.CTkButton(
+        themed_button(
             reset_card,
             text="Reset Analytics",
             command=self._reset_analytics,
@@ -807,7 +809,7 @@ class MainWindow(ctk.CTk):
         self.break_duration_entry.insert(0, str(self._break_duration_seconds))
         self.break_duration_entry.grid(row=3, column=1, sticky="e", padx=18, pady=8)
 
-        ctk.CTkButton(
+        themed_button(
             interval_card,
             text="Apply Focus & Eye-care Settings",
             command=self._apply_timer_settings,
@@ -832,7 +834,7 @@ class MainWindow(ctk.CTk):
         self.daily_goal_entry = ctk.CTkEntry(goal_card, width=140)
         self.daily_goal_entry.insert(0, str(self._daily_goal_minutes))
         self.daily_goal_entry.grid(row=1, column=1, sticky="e", padx=18, pady=8)
-        ctk.CTkButton(
+        themed_button(
             goal_card,
             text="Save Daily Goal",
             command=self._apply_daily_goal,
@@ -859,7 +861,7 @@ class MainWindow(ctk.CTk):
             text="Pause / meeting mode duration",
             text_color=COLORS["text_secondary"],
         ).grid(row=0, column=0, sticky="w", padx=18, pady=12)
-        self.meeting_duration_menu = ctk.CTkOptionMenu(
+        self.meeting_duration_menu = themed_option_menu(
             meeting_card,
             values=["30 minutes", "1 hour", "2 hours"],
             command=self._save_meeting_mode_duration,
@@ -868,7 +870,7 @@ class MainWindow(ctk.CTk):
         )
         self.meeting_duration_menu.set(self._meeting_duration_label())
         self.meeting_duration_menu.grid(row=0, column=1, sticky="e", padx=18, pady=12)
-        ctk.CTkButton(
+        themed_button(
             meeting_card,
             text="Start Meeting Mode",
             height=42,
@@ -894,7 +896,7 @@ class MainWindow(ctk.CTk):
             text="Break reminder style",
             text_color=COLORS["text_secondary"],
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4))
-        self.overlay_mode_menu = ctk.CTkOptionMenu(
+        self.overlay_mode_menu = themed_option_menu(
             overlay_card,
             values=["Full-screen overlay", "Corner toast"],
             command=self._save_break_overlay_mode,
@@ -915,7 +917,7 @@ class MainWindow(ctk.CTk):
             text="Break prompt",
             text_color=COLORS["text_secondary"],
         ).grid(row=3, column=0, sticky="w", padx=18, pady=(6, 4))
-        self.break_prompt_menu = ctk.CTkOptionMenu(
+        self.break_prompt_menu = themed_option_menu(
             overlay_card,
             values=[
                 "Eye-care (20-20-20)",
@@ -957,7 +959,7 @@ class MainWindow(ctk.CTk):
             text="Theme",
             text_color=COLORS["text_secondary"],
         ).grid(row=1, column=0, sticky="w", padx=18, pady=8)
-        self.appearance_menu = ctk.CTkOptionMenu(
+        self.appearance_menu = themed_option_menu(
             appearance_card,
             values=list(APPEARANCE_MODES),
             command=self._save_appearance_mode,
@@ -971,7 +973,7 @@ class MainWindow(ctk.CTk):
             text="Text size",
             text_color=COLORS["text_secondary"],
         ).grid(row=2, column=0, sticky="w", padx=18, pady=8)
-        self.text_size_menu = ctk.CTkOptionMenu(
+        self.text_size_menu = themed_option_menu(
             appearance_card,
             values=list(TEXT_SIZE_SCALING),
             command=self._save_text_size,
@@ -1003,21 +1005,21 @@ class MainWindow(ctk.CTk):
             wraplength=560,
             text_color=COLORS["text_muted"],
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 12))
-        ctk.CTkButton(
+        themed_button(
             privacy_card,
             text="Create Encrypted Backup",
             command=self._export_data_backup,
             fg_color=COLORS["control"],
             hover_color=COLORS["control_hover"],
         ).grid(row=2, column=0, sticky="ew", padx=(18, 8), pady=(0, 16))
-        ctk.CTkButton(
+        themed_button(
             privacy_card,
             text="Restore Backup",
             command=self._restore_data_backup,
             fg_color=COLORS["control"],
             hover_color=COLORS["control_hover"],
         ).grid(row=2, column=1, sticky="ew", padx=(8, 18), pady=(0, 16))
-        ctk.CTkButton(
+        themed_button(
             privacy_card,
             text="Replay Walkthrough",
             command=self._show_onboarding,
@@ -1033,7 +1035,7 @@ class MainWindow(ctk.CTk):
         )
         self.user_name_entry.insert(0, self._user_name)
         self.user_name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ctk.CTkButton(
+        themed_button(
             name_row,
             text="Save Name",
             command=self._save_user_name,
@@ -1053,14 +1055,14 @@ class MainWindow(ctk.CTk):
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(16, 8))
         profile_actions = ctk.CTkFrame(profile_card, fg_color="transparent")
         profile_actions.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=4)
-        ctk.CTkButton(
+        themed_button(
             profile_actions,
             text="New Profile",
             command=self._new_work_zone_profile,
             fg_color=COLORS["control"],
             hover_color=COLORS["control_hover"],
         ).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(
+        themed_button(
             profile_actions,
             text="Delete Profile",
             command=self._delete_work_zone_profile,
@@ -1092,7 +1094,7 @@ class MainWindow(ctk.CTk):
         )
         rule_editor = ctk.CTkFrame(profile_card, fg_color="transparent")
         rule_editor.grid(row=6, column=0, columnspan=2, sticky="ew", padx=18, pady=6)
-        self.profile_rule_type_menu = ctk.CTkOptionMenu(
+        self.profile_rule_type_menu = themed_option_menu(
             rule_editor,
             values=list(self.PROFILE_MATCH_TYPES),
             width=175,
@@ -1106,7 +1108,7 @@ class MainWindow(ctk.CTk):
             placeholder_text="Text to match",
         )
         self.profile_rule_entry.pack(side="left", fill="x", expand=True, padx=8)
-        ctk.CTkButton(
+        themed_button(
             rule_editor,
             text="Add Rule",
             command=self._add_work_zone_rule,
@@ -1123,7 +1125,7 @@ class MainWindow(ctk.CTk):
         self.profile_preview_label.grid(
             row=7, column=0, columnspan=2, sticky="w", padx=18, pady=6
         )
-        ctk.CTkButton(
+        themed_button(
             profile_card,
             text="Save and Activate Profile",
             command=self._save_work_zone_profile,
@@ -1163,7 +1165,7 @@ class MainWindow(ctk.CTk):
         self.focus_app_path_label.grid(
             row=2, column=0, sticky="ew", padx=(18, 8), pady=8
         )
-        ctk.CTkButton(
+        themed_button(
             guard_card,
             text="Choose .exe",
             command=self._choose_focus_app,
@@ -1195,7 +1197,7 @@ class MainWindow(ctk.CTk):
         guard_rule_editor.grid(
             row=5, column=0, columnspan=2, sticky="ew", padx=18, pady=6
         )
-        self.focus_guard_rule_type_menu = ctk.CTkOptionMenu(
+        self.focus_guard_rule_type_menu = themed_option_menu(
             guard_rule_editor,
             values=list(self.FOCUS_GUARD_MATCH_TYPES),
             width=165,
@@ -1209,14 +1211,14 @@ class MainWindow(ctk.CTk):
             placeholder_text="Blocked app, title, path, or URL text",
         )
         self.focus_guard_rule_entry.pack(side="left", fill="x", expand=True, padx=8)
-        ctk.CTkButton(
+        themed_button(
             guard_rule_editor,
             text="Add Rule",
             command=self._add_focus_guard_rule,
             fg_color=COLORS["control"],
             hover_color=COLORS["control_hover"],
         ).pack(side="left", padx=(8, 0))
-        ctk.CTkButton(
+        themed_button(
             guard_card,
             text="Save Block Rules",
             command=self._save_focus_guard_rules,
@@ -1557,7 +1559,7 @@ class MainWindow(ctk.CTk):
                 wraplength=380,
                 text_color=COLORS["text_secondary"],
             ).grid(row=0, column=1, sticky="ew", padx=4)
-            ctk.CTkButton(
+            themed_button(
                 row,
                 text="Remove",
                 width=72,
@@ -1781,7 +1783,7 @@ class MainWindow(ctk.CTk):
                 wraplength=380,
                 text_color=COLORS["text_secondary"],
             ).grid(row=0, column=1, sticky="ew", padx=4)
-            ctk.CTkButton(
+            themed_button(
                 row,
                 text="Remove",
                 width=72,
@@ -1944,14 +1946,14 @@ class MainWindow(ctk.CTk):
         self._onboarding_feedback_label.pack(fill="x", pady=(0, 8))
         actions = ctk.CTkFrame(content, fg_color="transparent")
         actions.pack(fill="x", pady=(20, 8))
-        ctk.CTkButton(
+        themed_button(
             actions,
             text="Skip walkthrough",
             command=lambda: self._save_onboarding_name(start_walkthrough=False),
             fg_color=COLORS["control"],
             hover_color=COLORS["control_hover"],
         ).pack(side="right")
-        ctk.CTkButton(
+        themed_button(
             actions,
             text="Continue",
             command=lambda: self._save_onboarding_name(start_walkthrough=True),
@@ -2034,7 +2036,7 @@ class MainWindow(ctk.CTk):
         ).pack(fill="x", pady=8)
         actions = ctk.CTkFrame(content, fg_color="transparent")
         actions.pack(fill="x", pady=(34, 8))
-        ctk.CTkButton(
+        themed_button(
             actions,
             text="Skip walkthrough",
             command=self._finish_onboarding,
@@ -2042,14 +2044,14 @@ class MainWindow(ctk.CTk):
             hover_color=COLORS["control_hover"],
         ).pack(side="left")
         if step > 0:
-            ctk.CTkButton(
+            themed_button(
                 actions,
                 text="Back",
                 command=lambda: self._render_walkthrough_step(step - 1),
                 fg_color=COLORS["control"],
                 hover_color=COLORS["control_hover"],
             ).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(
+        themed_button(
             actions,
             text="Finish" if step == len(steps) - 1 else "Next",
             command=(

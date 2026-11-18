@@ -45,6 +45,27 @@ class LightThemeTests(unittest.TestCase):
                     4.5,
                 )
 
+    def test_interactive_control_text_has_accessible_contrast_in_both_themes(self) -> None:
+        for appearance_index in range(2):
+            with self.subTest(appearance_index=appearance_index):
+                for foreground_key, background_key in (
+                    ("text_primary", "control"),
+                    ("text_primary", "control_hover"),
+                    ("text_secondary", "control"),
+                    ("text_primary", "segment_background"),
+                    ("text_primary", "segment_selected"),
+                    ("text_primary", "segment_selected_hover"),
+                    ("text_on_accent", "accent"),
+                    ("text_on_accent", "accent_hover"),
+                ):
+                    self.assertGreaterEqual(
+                        _contrast_ratio(
+                            COLORS[foreground_key][appearance_index],
+                            COLORS[background_key][appearance_index],
+                        ),
+                        4.5,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

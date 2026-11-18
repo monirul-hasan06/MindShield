@@ -10,6 +10,7 @@ from collections.abc import Callable
 import customtkinter as ctk
 
 from src.gui.theme import COLORS
+from src.gui.themed_controls import themed_button
 
 
 class OverlayWindow(ctk.CTkToplevel):
@@ -91,7 +92,7 @@ class OverlayWindow(ctk.CTkToplevel):
 
         actions = ctk.CTkFrame(content, fg_color="transparent")
         actions.pack(fill="x", padx=24, pady=(0, 20))
-        self.pause_button = ctk.CTkButton(
+        self.pause_button = themed_button(
             actions,
             text="Pause Break",
             command=self._request_pause,
@@ -99,7 +100,7 @@ class OverlayWindow(ctk.CTkToplevel):
             hover_color=COLORS["control_hover"],
         )
         self.pause_button.pack(side="left", expand=True, fill="x", padx=(0, 8))
-        self.return_button = ctk.CTkButton(
+        self.return_button = themed_button(
             actions,
             text="Back to Work",
             command=self._request_return_to_work,
