@@ -153,8 +153,13 @@ class TrayManager:
 
     def _exit(self, *_args: Any) -> None:
         del _args
-        self.stop()
+        self._dispatch_to_window(self._request_exit)
+
+    def _request_exit(self) -> None:
         if self.on_exit is not None:
-            self._dispatch_to_window(self.on_exit)
+            self.on_exit()
         else:
-            self._dispatch_to_window(self.window.destroy)
+            self.window.destroy()
+
+        if getattr(self.window, "_closing", True):
+            self.stop()

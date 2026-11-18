@@ -28,8 +28,9 @@ class _SwipeGestureManager:
         ctk.CTkTextbox,
     )
 
-    def __init__(self, root: tk.Misc) -> None:
+    def __init__(self, root: tk.Misc, reduced_motion: bool = False) -> None:
         self.root = root
+        self._reduced_motion = reduced_motion
         self._active_frame: SwipeScrollableFrame | None = None
         self._scroll_targets: weakref.WeakKeyDictionary[
             SwipeScrollableFrame, float
@@ -149,6 +150,11 @@ class _SwipeGestureManager:
         if abs(target - current_target) < 0.000001:
             return False
 
+        if self._reduced_motion:
+            self._cancel_scroll_animation(frame)
+            canvas.yview_moveto(target)
+            return True
+
         self._scroll_targets[frame] = target
         if frame not in self._scroll_after_ids:
             self._scroll_animation_origins[frame] = (first, time.monotonic())
@@ -203,6 +209,16 @@ class _SwipeGestureManager:
         after_id = self.root.after(16, self._scroll_step, frame)
         self._scroll_after_ids[frame] = after_id
 
+    def set_reduced_motion(self, enabled: bool) -> None:
+        self._reduced_motion = enabled
+        if not enabled:
+            return
+
+        for frame, target in list(self._scroll_targets.items()):
+            if frame.winfo_exists():
+                self._cancel_scroll_animation(frame)
+                frame._parent_canvas.yview_moveto(target)
+
     @staticmethod
     def _find_scrollable_frame(widget: tk.Misc) -> SwipeScrollableFrame | None:
         current: tk.Misc | None = widget
@@ -230,7 +246,15 @@ class SwipeScrollableFrame(ctk.CTkScrollableFrame):
         weakref.WeakKeyDictionary()
     )
 
-    def __init__(self, master: tk.Misc, **kwargs: object) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        reduced_motion: bool = False,
+        **kwargs: object,
+    ) -> None:
+        if not isinstance(reduced_motion, bool):
+            raise TypeError("reduced_motion must be a bool")
         kwargs.setdefault("scrollbar_fg_color", "transparent")
         kwargs.setdefault("scrollbar_button_color", COLORS["control_hover"])
         kwargs.setdefault("scrollbar_button_hover_color", COLORS["accent"])
@@ -238,9 +262,17 @@ class SwipeScrollableFrame(ctk.CTkScrollableFrame):
         root = self.winfo_toplevel()
         manager = self._managers.get(root)
         if manager is None:
-            manager = _SwipeGestureManager(root)
+            manager = _SwipeGestureManager(root, reduced_motion)
             self._managers[root] = manager
+        else:
+            manager.set_reduced_motion(reduced_motion)
         self._gesture_manager = manager
+
+    def set_reduced_motion(self, enabled: bool) -> None:
+        """Enable or disable animated scrolling for this window's scroll areas."""
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool")
+        self._gesture_manager.set_reduced_motion(enabled)
 
     def _mouse_wheel_all(self, event: tk.Event) -> None:
         if self._check_if_valid_scroll(event.widget):

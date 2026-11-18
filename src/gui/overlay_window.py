@@ -34,6 +34,7 @@ class OverlayWindow(ctk.CTkToplevel):
         message: str = MESSAGE,
         on_pause: Callable[[], None] | None = None,
         on_return_to_work: Callable[[], None] | None = None,
+        reduced_motion: bool = False,
     ) -> None:
         if isinstance(break_duration_sec, bool) or not isinstance(break_duration_sec, int):
             raise TypeError("break_duration_sec must be an integer")
@@ -43,6 +44,8 @@ class OverlayWindow(ctk.CTkToplevel):
             raise ValueError("mode must be 'overlay' or 'toast'")
         if not isinstance(message, str):
             raise TypeError("message must be a string")
+        if not isinstance(reduced_motion, bool):
+            raise TypeError("reduced_motion must be a bool")
 
         super().__init__(master)
         self._remaining_seconds = break_duration_sec
@@ -51,6 +54,7 @@ class OverlayWindow(ctk.CTkToplevel):
         self._fade_after_id: str | None = None
         self._on_pause = on_pause
         self._on_return_to_work = on_return_to_work
+        self._reduced_motion = reduced_motion
         self._paused = False
         self._target_alpha = 0.84 if mode == "overlay" else 0.94
         self._fading_out = False
@@ -147,6 +151,10 @@ class OverlayWindow(ctk.CTkToplevel):
         self._update_countdown()
 
     def _fade_in(self, step: int = 0) -> None:
+        if self._reduced_motion:
+            self.attributes("-alpha", self._target_alpha)
+            self._fade_after_id = None
+            return
         self.attributes("-alpha", self._target_alpha * step / 8)
         if step >= 8:
             self._fade_after_id = None
@@ -154,6 +162,10 @@ class OverlayWindow(ctk.CTkToplevel):
         self._fade_after_id = self.after(20, self._fade_in, step + 1)
 
     def _fade_out(self, step: int = 0) -> None:
+        if self._reduced_motion:
+            self._fade_after_id = None
+            self.destroy()
+            return
         self.attributes("-alpha", self._target_alpha * (1 - step / 8))
         if step >= 8:
             self._fade_after_id = None

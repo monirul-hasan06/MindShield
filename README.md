@@ -55,14 +55,16 @@ The output is `dist\MindShield`. Compile `MindShield.iss` with Inno Setup 6 to c
 - Start manual 5-, 10-, or 15-minute breaks from the Dashboard. Pause and resume scheduled or manual breaks without losing the remaining break time, or return to work early. An early-ended break remains incomplete in break history; manual breaks resume the saved focus time, while scheduled breaks start a new focus interval.
 - Demo mode shortens work and break intervals for demonstrations; it is not enabled by default.
 - Choose Light, Dark, or System appearance from either the Dashboard or Settings, and Small, Default, or Large text from Settings; Dark remains the default. The dashboard and settings theme controls stay synchronized.
+- Enable **Reduce motion** in Settings to use immediate scrolling and timer progress updates and to disable onboarding and break-overlay fades. It is off by default.
+- Press **Ctrl+Shift+Space** to pause or resume active work and breaks. The shortcut is ignored while a text field is focused.
 - First-run onboarding asks for a name used in the Dashboard's time-of-day greeting. Its feature walkthrough can be skipped and replayed from Settings; you can update your name there as well. Break reminders can show the eye-care prompt, a stretch prompt, a hydration prompt, or no prompt.
 - Session history can be filtered to the last 7 days, last 30 days, or all history, and searched by work-zone name. CSV export uses the same filters and includes only date, start time, duration, and work-zone name.
-- The productivity profile totals recorded work-segment time and completed manual or scheduled breaks. Paused time is excluded; active work is committed when paused, stopped, or transitioned to a break, so an abrupt app exit can leave the current segment unrecorded.
+- The productivity profile totals recorded work-segment time and completed manual or scheduled breaks. Paused time is excluded; active work is committed when paused, stopped, transitioned to a break, or explicitly exiting. Closing the window to the system tray keeps the session running; a crash or forced shutdown can still leave the current segment unrecorded.
 - Use **Profile & Analytics → Reset Analytics** to clear saved focus totals, break history, and session history while keeping settings and work-zone profiles. MindShield asks for confirmation; active work restarts its tracked duration from zero, and an in-progress break remains tracked.
 - MindShield currently targets Windows; it does not provide cloud sync or cross-device data transfer.
 
-## Suggested next updates
+## Potential future improvements
 
-1. Improve keyboard navigation and screen-reader labels.
-2. Consider additional analytics views while keeping window metadata out of stored history.
-3. Add localization after the user-facing workflows are stable.
+1. Add named focus presets for different routines.
+2. Expand break analytics to distinguish completed breaks from breaks ended early.
+3. Consider localization after the user-facing workflows are stable.

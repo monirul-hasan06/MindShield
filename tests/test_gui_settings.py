@@ -1,9 +1,8 @@
-import sqlite3
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.gui.main_window import MainWindow
+from src.gui.main_window import MainWindow, sqlite3 as database_sqlite3
 
 
 class EyeCareSettingsTests(unittest.TestCase):
@@ -86,7 +85,9 @@ class AppearanceSettingsTests(unittest.TestCase):
 
     def test_failed_theme_save_restores_both_menus(self) -> None:
         window = self._window()
-        window.database.set_settings.side_effect = sqlite3.Error("database unavailable")
+        window.database.set_settings.side_effect = database_sqlite3.Error(
+            "database unavailable"
+        )
 
         with patch("src.gui.main_window.ctk.set_appearance_mode") as set_appearance:
             MainWindow._save_appearance_mode(window, "Light")
@@ -96,6 +97,73 @@ class AppearanceSettingsTests(unittest.TestCase):
         window.dashboard_appearance_menu.set.assert_called_once_with("Dark")
         set_appearance.assert_not_called()
         window.status_label.configure.assert_called_once()
+
+
+class ReducedMotionSettingsTests(unittest.TestCase):
+    def _window(self, current: bool, selected: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            database=Mock(),
+            reduced_motion_switch=Mock(get=Mock(return_value=selected)),
+            _reduced_motion=current,
+            dashboard_scroll_frame=Mock(),
+            status_label=Mock(),
+        )
+
+    def test_saves_and_applies_reduced_motion(self) -> None:
+        window = self._window(current=False, selected=1)
+
+        MainWindow._save_reduced_motion(window)
+
+        window.database.set_settings.assert_called_once_with(
+            {"reduced_motion": "true"}
+        )
+        self.assertTrue(window._reduced_motion)
+        window.dashboard_scroll_frame.set_reduced_motion.assert_called_once_with(
+            True
+        )
+
+    def test_failed_save_restores_previous_toggle_state(self) -> None:
+        window = self._window(current=False, selected=1)
+        window.database.set_settings.side_effect = database_sqlite3.Error(
+            "database unavailable"
+        )
+
+        MainWindow._save_reduced_motion(window)
+
+        self.assertFalse(window._reduced_motion)
+        window.reduced_motion_switch.deselect.assert_called_once()
+        window.dashboard_scroll_frame.set_reduced_motion.assert_not_called()
+        window.status_label.configure.assert_called_once()
+
+
+class KeyboardShortcutTests(unittest.TestCase):
+    def test_shortcut_toggles_active_work(self) -> None:
+        window = SimpleNamespace(
+            timer_manager=SimpleNamespace(state="work"),
+            _toggle_work_pause=Mock(),
+        )
+        event = SimpleNamespace(widget=SimpleNamespace(master=None))
+
+        result = MainWindow._toggle_work_pause_shortcut(window, event)
+
+        self.assertEqual(result, "break")
+        window._toggle_work_pause.assert_called_once()
+
+    def test_shortcut_does_not_interfere_with_text_entry(self) -> None:
+        class FakeEntry:
+            master = None
+
+        window = SimpleNamespace(
+            timer_manager=SimpleNamespace(state="work"),
+            _toggle_work_pause=Mock(),
+        )
+        event = SimpleNamespace(widget=FakeEntry())
+
+        with patch("src.gui.main_window.ctk.CTkEntry", FakeEntry):
+            result = MainWindow._toggle_work_pause_shortcut(window, event)
+
+        self.assertIsNone(result)
+        window._toggle_work_pause.assert_not_called()
 
 
 if __name__ == "__main__":

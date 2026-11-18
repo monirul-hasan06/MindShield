@@ -53,6 +53,7 @@ class SwipeScrollAnimationTests(unittest.TestCase):
     def _manager(self) -> _SwipeGestureManager:
         manager = object.__new__(_SwipeGestureManager)
         manager.root = _FakeRoot()
+        manager._reduced_motion = False
         manager._scroll_targets = weakref.WeakKeyDictionary()
         manager._scroll_after_ids = weakref.WeakKeyDictionary()
         manager._scroll_animation_origins = weakref.WeakKeyDictionary()
@@ -81,6 +82,17 @@ class SwipeScrollAnimationTests(unittest.TestCase):
         self.assertNotIn(frame, manager._scroll_targets)
         self.assertNotIn(frame, manager._scroll_animation_origins)
         self.assertEqual(manager.root.callbacks, [])
+
+    def test_reduced_motion_moves_to_target_without_scheduling_animation(self) -> None:
+        manager = self._manager()
+        manager._reduced_motion = True
+        frame = _FakeFrame()
+
+        self.assertTrue(manager._animate_to(frame, 0.6))
+
+        self.assertAlmostEqual(frame._parent_canvas.position, 0.6)
+        self.assertEqual(manager.root.callbacks, [])
+        self.assertNotIn(frame, manager._scroll_targets)
 
 
 if __name__ == "__main__":

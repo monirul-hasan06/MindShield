@@ -7,6 +7,7 @@ import sys
 import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
 from zipfile import BadZipFile
 
@@ -168,6 +169,10 @@ class MainWindow(ctk.CTk):
         if saved_text_size not in (None, *TEXT_SIZE_SCALING.keys()):
             raise ValueError("Saved text size must be Small, Default, or Large")
         self._text_size = saved_text_size or "Default"
+        saved_reduced_motion = self.database.get_setting("reduced_motion")
+        if saved_reduced_motion not in (None, "true", "false"):
+            raise ValueError("Saved reduced motion setting must be 'true' or 'false'")
+        self._reduced_motion = saved_reduced_motion == "true"
         ctk.set_appearance_mode(self._appearance_mode)
         ctk.set_widget_scaling(TEXT_SIZE_SCALING[self._text_size])
         self._work_started = False
@@ -190,6 +195,7 @@ class MainWindow(ctk.CTk):
         self._progress_animation_target = 1.0
         self._progress_animation_step = 0
         self._timer_progress_value = 1.0
+        self._pending_work_segments: list[tuple[int, str]] = []
 
         self.timer_manager = timer_manager or TimerManager(
             work_interval_sec=self._work_interval_minutes * 60,
@@ -225,6 +231,11 @@ class MainWindow(ctk.CTk):
         self.tray_manager: TrayManager | None = None
 
         self._build_interface()
+        self.bind_all(
+            "<Control-Shift-space>",
+            self._toggle_work_pause_shortcut,
+            add="+",
+        )
         self._refresh_dashboard_greeting()
         self._refresh_analytics()
         if self._show_first_run_onboarding:
@@ -310,6 +321,7 @@ class MainWindow(ctk.CTk):
     def _build_dashboard(self) -> None:
         tab = SwipeScrollableFrame(
             self.dashboard_tab,
+            reduced_motion=self._reduced_motion,
             fg_color="transparent",
         )
         tab.grid(row=0, column=0, sticky="nsew")
@@ -510,6 +522,7 @@ class MainWindow(ctk.CTk):
     def _build_analytics(self) -> None:
         tab = SwipeScrollableFrame(
             self.analytics_tab,
+            reduced_motion=self._reduced_motion,
             fg_color="transparent",
         )
         tab.grid(row=0, column=0, sticky="nsew")
@@ -763,6 +776,7 @@ class MainWindow(ctk.CTk):
     def _build_settings(self) -> None:
         tab = SwipeScrollableFrame(
             self.settings_tab,
+            reduced_motion=self._reduced_motion,
             fg_color="transparent",
         )
         tab.grid(row=0, column=0, sticky="nsew")
@@ -982,6 +996,22 @@ class MainWindow(ctk.CTk):
         )
         self.text_size_menu.set(self._text_size)
         self.text_size_menu.grid(row=2, column=1, sticky="e", padx=18, pady=(8, 16))
+        self.reduced_motion_switch = ctk.CTkSwitch(
+            appearance_card,
+            text="Reduce motion",
+            command=self._save_reduced_motion,
+            progress_color=COLORS["accent"],
+        )
+        if self._reduced_motion:
+            self.reduced_motion_switch.select()
+        self.reduced_motion_switch.grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=18,
+            pady=(8, 16),
+        )
         appearance_card.grid_columnconfigure(0, weight=1)
 
         privacy_card = ctk.CTkFrame(tab, fg_color=COLORS["card_background"], corner_radius=16)
@@ -1086,6 +1116,7 @@ class MainWindow(ctk.CTk):
         self.profile_rules_frame = SwipeScrollableFrame(
             profile_card,
             height=130,
+            reduced_motion=self._reduced_motion,
             fg_color=COLORS["app_background"],
         )
         self.profile_rules_frame.grid_columnconfigure(0, weight=1)
@@ -1187,6 +1218,7 @@ class MainWindow(ctk.CTk):
         self.focus_guard_rules_frame = SwipeScrollableFrame(
             guard_card,
             height=110,
+            reduced_motion=self._reduced_motion,
             fg_color=COLORS["app_background"],
         )
         self.focus_guard_rules_frame.grid_columnconfigure(0, weight=1)
@@ -1359,9 +1391,8 @@ class MainWindow(ctk.CTk):
             elapsed_seconds = int(round(self.timer_manager.last_completed_work_sec))
             if elapsed_seconds > 0:
                 try:
-                    self.database.log_work_segment(
-                        elapsed_seconds,
-                        self.active_work_zone,
+                    self._record_work_segment(
+                        elapsed_seconds, self.active_work_zone
                     )
                     self._refresh_analytics()
                 except (OSError, sqlite3.Error, RuntimeError, ValueError) as error:
@@ -1394,9 +1425,8 @@ class MainWindow(ctk.CTk):
             elapsed_seconds = int(round(self.timer_manager.last_completed_work_sec))
             if elapsed_seconds > 0:
                 try:
-                    self.database.log_work_segment(
-                        elapsed_seconds,
-                        self.active_work_zone,
+                    self._record_work_segment(
+                        elapsed_seconds, self.active_work_zone
                     )
                     self._refresh_analytics()
                 except (OSError, sqlite3.Error, RuntimeError, ValueError) as error:
@@ -1426,6 +1456,68 @@ class MainWindow(ctk.CTk):
             self.status_label.configure(
                 text="Work can only be paused or resumed during a work interval."
             )
+
+    def _record_work_segment_locked(
+        self,
+        elapsed_seconds: int,
+        work_zone: str,
+    ) -> None:
+        if elapsed_seconds > 0:
+            self._pending_work_segments.append((elapsed_seconds, work_zone))
+        while self._pending_work_segments:
+            pending_seconds, pending_zone = self._pending_work_segments[0]
+            self.database.log_work_segment(pending_seconds, pending_zone)
+            self._pending_work_segments.pop(0)
+
+    def _record_work_segment(self, elapsed_seconds: int, work_zone: str) -> None:
+        with self._activity_data_lock:
+            self._record_work_segment_locked(elapsed_seconds, work_zone)
+
+    def _save_work_before_exit(self) -> bool:
+        elapsed_seconds = 0
+        if self.timer_manager.state == "work":
+            self.timer_manager.pause_work()
+            if self.timer_manager.state == "paused":
+                elapsed_seconds = int(
+                    round(self.timer_manager.last_completed_work_sec)
+                )
+        try:
+            with self._activity_data_lock:
+                self._record_work_segment_locked(
+                    elapsed_seconds,
+                    self.active_work_zone,
+                )
+        except (OSError, sqlite3.Error, RuntimeError, ValueError) as error:
+            messagebox.showerror(
+                "Could not save focus time",
+                "MindShield could not save the active work segment. "
+                f"The app will stay open so you can retry: {error}",
+                parent=self,
+            )
+            return False
+        return True
+
+    def _toggle_work_pause_shortcut(self, event: tk.Event) -> str | None:
+        current: tk.Misc | None = event.widget
+        while current is not None:
+            if isinstance(
+                current,
+                (ctk.CTkEntry, ctk.CTkTextbox, tk.Entry, tk.Text),
+            ):
+                return None
+            current = getattr(current, "master", None)
+
+        if self.timer_manager.state not in (
+            "work",
+            "paused",
+            "break",
+            "manual_break",
+            "break_paused",
+        ):
+            return None
+
+        self._toggle_work_pause()
+        return "break"
 
     def _start_selected_break(self) -> None:
         try:
@@ -1896,6 +1988,7 @@ class MainWindow(ctk.CTk):
             dialog,
             width=464,
             height=352,
+            reduced_motion=self._reduced_motion,
             fg_color="transparent",
         )
         self._onboarding_content.pack(
@@ -2071,6 +2164,10 @@ class MainWindow(ctk.CTk):
         if self._onboarding_animation_after_id is not None:
             self.after_cancel(self._onboarding_animation_after_id)
             self._onboarding_animation_after_id = None
+
+        if self._reduced_motion:
+            dialog.attributes("-alpha", 1.0)
+            return
 
         dialog.attributes("-alpha", 0.9)
         self._onboarding_animation_step = 0
@@ -2336,6 +2433,32 @@ class MainWindow(ctk.CTk):
         ctk.set_widget_scaling(scaling)
         self.status_label.configure(text=f"Text size set to {label}.")
 
+    def _save_reduced_motion(self) -> None:
+        enabled = self.reduced_motion_switch.get() in (True, 1, "on")
+        try:
+            self.database.set_settings(
+                {"reduced_motion": "true" if enabled else "false"}
+            )
+        except sqlite3.Error as error:
+            if self._reduced_motion:
+                self.reduced_motion_switch.select()
+            else:
+                self.reduced_motion_switch.deselect()
+            self.status_label.configure(
+                text=f"Could not save reduced-motion preference: {error}"
+            )
+            return
+
+        self._reduced_motion = enabled
+        self.dashboard_scroll_frame.set_reduced_motion(enabled)
+        self.status_label.configure(
+            text=(
+                "Reduced motion enabled."
+                if enabled
+                else "Reduced motion disabled."
+            )
+        )
+
     def _toggle_demo_mode(self) -> None:
         enabled = self._demo_mode_enabled()
         try:
@@ -2489,12 +2612,21 @@ class MainWindow(ctk.CTk):
         if self._progress_animation_after_id is not None:
             self.after_cancel(self._progress_animation_after_id)
             self._progress_animation_after_id = None
+        if self._reduced_motion:
+            self._timer_progress_value = target
+            self.timer_progress.set(target)
+            return
         self._progress_animation_start = self._timer_progress_value
         self._progress_animation_target = target
         self._progress_animation_step = 0
         self._advance_timer_progress()
 
     def _advance_timer_progress(self) -> None:
+        if self._reduced_motion:
+            self._timer_progress_value = self._progress_animation_target
+            self.timer_progress.set(self._timer_progress_value)
+            self._progress_animation_after_id = None
+            return
         self._progress_animation_step += 1
         position = min(1.0, self._progress_animation_step / 8)
         eased_position = position * position * (3 - 2 * position)
@@ -2527,7 +2659,7 @@ class MainWindow(ctk.CTk):
                 )
                 self._scheduled_break_id = None
                 if work_seconds > 0:
-                    self.database.log_work_segment(
+                    self._record_work_segment_locked(
                         work_seconds,
                         self.active_work_zone,
                     )
@@ -2558,6 +2690,7 @@ class MainWindow(ctk.CTk):
             duration,
             mode=self._break_overlay_mode,
             message=message,
+            reduced_motion=self._reduced_motion,
             on_pause=self._toggle_work_pause,
             on_return_to_work=self._return_to_work_early,
         )
@@ -2823,6 +2956,8 @@ class MainWindow(ctk.CTk):
     def destroy(self) -> None:
         """Stop background workers and owned windows before closing the app."""
         if not self._closing:
+            if not self._save_work_before_exit():
+                return
             self._closing = True
             if self._greeting_refresh_after_id is not None:
                 self.after_cancel(self._greeting_refresh_after_id)
