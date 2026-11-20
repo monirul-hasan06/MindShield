@@ -72,7 +72,7 @@ class AppearanceSettingsTests(unittest.TestCase):
     def test_saves_and_synchronizes_dashboard_and_settings_themes(self) -> None:
         window = self._window()
 
-        with patch("src.gui.main_window.ctk.set_appearance_mode") as set_appearance:
+        with patch("src.gui.settings_view.ctk.set_appearance_mode") as set_appearance:
             MainWindow._save_appearance_mode(window, "Light")
 
         window.database.set_settings.assert_called_once_with(
@@ -89,7 +89,7 @@ class AppearanceSettingsTests(unittest.TestCase):
             "database unavailable"
         )
 
-        with patch("src.gui.main_window.ctk.set_appearance_mode") as set_appearance:
+        with patch("src.gui.settings_view.ctk.set_appearance_mode") as set_appearance:
             MainWindow._save_appearance_mode(window, "Light")
 
         self.assertEqual(window._appearance_mode, "dark")
@@ -149,6 +149,17 @@ class KeyboardShortcutTests(unittest.TestCase):
         self.assertEqual(result, "break")
         window._toggle_work_pause.assert_called_once()
 
+    def test_global_hotkey_toggles_work_while_the_window_is_withdrawn(self) -> None:
+        window = SimpleNamespace(
+            timer_manager=SimpleNamespace(state="work"),
+            _toggle_work_pause=Mock(),
+            focus_get=Mock(return_value=None),
+        )
+
+        MainWindow._handle_global_hotkey(window)
+
+        window._toggle_work_pause.assert_called_once()
+
     def test_shortcut_does_not_interfere_with_text_entry(self) -> None:
         class FakeEntry:
             master = None
@@ -159,7 +170,7 @@ class KeyboardShortcutTests(unittest.TestCase):
         )
         event = SimpleNamespace(widget=FakeEntry())
 
-        with patch("src.gui.main_window.ctk.CTkEntry", FakeEntry):
+        with patch("src.gui.user_text.ctk.CTkEntry", FakeEntry):
             result = MainWindow._toggle_work_pause_shortcut(window, event)
 
         self.assertIsNone(result)

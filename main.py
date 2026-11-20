@@ -1,5 +1,7 @@
 """Launch the MindShield desktop application."""
 
+from src.core.logging_config import configure_logging
+from src.core.single_instance import SingleInstance
 from src.core.timer_manager import TimerManager
 from src.core.tray_manager import TrayManager
 from src.core.window_tracker import WindowTracker
@@ -9,6 +11,11 @@ from src.gui.main_window import MainWindow
 
 def main() -> None:
     """Initialize persistence and launch the GUI."""
+    configure_logging()
+    instance = SingleInstance()
+    if not instance.acquired:
+        return
+
     database = DatabaseHandler()
 
     timer_manager = TimerManager()
@@ -19,13 +26,17 @@ def main() -> None:
         window_tracker=window_tracker,
         start_tray=False,
     )
+    instance.listen(lambda: app.after(0, app.present_window))
     tray_manager = TrayManager(
         app_instance=app,
         on_meeting_mode=app._start_meeting_break,
         on_exit=app.destroy,
     )
     app.attach_tray_manager(tray_manager)
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":

@@ -36,9 +36,10 @@ When running from source, the database is stored as `mindshield.db` in the repos
 
 ## Build and install
 
-Build the one-folder application from the repository root:
+Build the one-folder application from the repository root. Install the build tools first; they are not required to run the app from source:
 
 ```powershell
+python -m pip install -r requirements-build.txt
 pyinstaller MindShield.spec
 ```
 
@@ -46,7 +47,7 @@ The output is `dist\MindShield`. Compile `MindShield.iss` with Inno Setup 6 to c
 
 ## Current behavior and limitations
 
-- Work-zone profiles can match window titles, process names, executable paths, browser URLs, and Explorer folder paths where Windows exposes them through accessibility controls.
+- Work-zone profiles can match window titles, process names, executable paths, browser URLs, and Explorer folder paths where Windows exposes them through accessibility controls. Each rule is either a substring (**Contains**) or a whole word/path segment (**Whole word**). Existing rules stay substring matches.
 - Dashboard, Profile & Analytics, Settings, onboarding, and nested rule lists support eased vertical scrolling with the mouse wheel/touchpad, click-and-drag, or Page Up/Page Down/Home/End keys.
 - Distraction suppression is optional and disabled by default.
 - Set the focus and automatic eye-care interval from 1 to 240 minutes on the Dashboard or in Settings. The eye-care break length is separately adjustable in seconds. Starting work with a custom Dashboard interval saves it as the next default.
@@ -56,10 +57,10 @@ The output is `dist\MindShield`. Compile `MindShield.iss` with Inno Setup 6 to c
 - Demo mode shortens work and break intervals for demonstrations; it is not enabled by default.
 - Choose Light, Dark, or System appearance from either the Dashboard or Settings, and Small, Default, or Large text from Settings; Dark remains the default. The dashboard and settings theme controls stay synchronized.
 - Enable **Reduce motion** in Settings to use immediate scrolling and timer progress updates and to disable onboarding and break-overlay fades. It is off by default.
-- Press **Ctrl+Shift+Space** to pause or resume active work and breaks. The shortcut is ignored while a text field is focused.
+- Press **Ctrl+Shift+Space** to pause or resume active work and breaks, including while the window is hidden in the system tray. The shortcut is ignored while a MindShield text field is focused. A second launch shows the window that is already running.
 - First-run onboarding asks for a name used in the Dashboard's time-of-day greeting. Its feature walkthrough can be skipped and replayed from Settings; you can update your name there as well. Break reminders can show the eye-care prompt, a stretch prompt, a hydration prompt, or no prompt.
-- Session history can be filtered to the last 7 days, last 30 days, or all history, and searched by work-zone name. CSV export uses the same filters and includes only date, start time, duration, and work-zone name.
-- The productivity profile totals recorded work-segment time and completed manual or scheduled breaks. Paused time is excluded; active work is committed when paused, stopped, transitioned to a break, or explicitly exiting. Closing the window to the system tray keeps the session running; a crash or forced shutdown can still leave the current segment unrecorded.
+- Session history can be filtered to the last 7 days, last 30 days, or all history, and searched by work-zone name. CSV export uses the same filters and includes only date, start time, duration in seconds, and work-zone name. Dashboard totals use those recorded seconds, and each saved segment keeps the time work actually started.
+- The productivity profile totals recorded work-segment time and completed manual or scheduled breaks. Paused time is excluded; active work is committed when paused, stopped, transitioned to a break, or explicitly exiting. Closing the window to the system tray keeps the session running; a crash or forced shutdown can still leave the current segment unrecorded. An invalid saved setting falls back to its default instead of blocking startup. Diagnostic logs are written to `%LOCALAPPDATA%\MindShield\mindshield.log`.
 - Use **Profile & Analytics → Reset Analytics** to clear saved focus totals, break history, and session history while keeping settings and work-zone profiles. MindShield asks for confirmation; active work restarts its tracked duration from zero, and an in-progress break remains tracked.
 - MindShield currently targets Windows; it does not provide cloud sync or cross-device data transfer.
 

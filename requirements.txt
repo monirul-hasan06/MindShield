@@ -1,9 +1,8 @@
-customtkinter
-Pillow
-psutil
-pystray
-pywin32; platform_system == "Windows"
-pywinauto; platform_system == "Windows"
-PyInstaller
-pywinctl
+customtkinter==6.0.0
+Pillow==13.0.0
+psutil==7.2.2
+pystray==0.19.5
+pywin32==312; platform_system == "Windows"
+pywinauto==0.6.9; platform_system == "Windows"
+PyWinCtl==0.4.1
 sqlcipher3-wheels==0.5.7

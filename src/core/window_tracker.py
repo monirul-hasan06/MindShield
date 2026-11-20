@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import PureWindowsPath
 from urllib.parse import unquote
@@ -30,6 +32,8 @@ class WindowTracker:
     """
 
     MATCH_TYPES = frozenset({"any", "title", "process", "path", "accessible"})
+    MATCH_MODES = frozenset({"contains", "token"})
+    ACCESSIBLE_CACHE_SECONDS = 5.0
 
     def __init__(
         self,
@@ -66,6 +70,7 @@ class WindowTracker:
         self._thread: threading.Thread | None = None
         self._manual_break = False
         self._last_reported_title: str | None = None
+        self._accessible_cache: tuple[int, str, float, tuple[str, ...]] | None = None
 
     @staticmethod
     def _validate_zone(zone_title: str) -> None:
@@ -109,20 +114,15 @@ class WindowTracker:
     ) -> None:
         """Apply a named profile with enabled typed matching rules."""
         self._validate_zone(profile_name)
-        normalized_rules: list[tuple[str, str]] = []
+        normalized_rules: list[tuple[str, str, str]] = []
         for rule in rules:
-            if not isinstance(rule, tuple) or len(rule) != 3:
-                raise ValueError("Each work-zone rule must have three values")
-            match_type, pattern, enabled = rule
-            if not isinstance(match_type, str) or match_type not in self.MATCH_TYPES:
-                raise ValueError(f"Unsupported work-zone match type: {match_type!r}")
-            if not isinstance(pattern, str):
-                raise TypeError("Rule patterns must be strings")
-            self._validate_zone(pattern)
-            if not isinstance(enabled, bool):
-                raise TypeError("Rule enabled flags must be bool values")
+            match_type, pattern, enabled, match_mode = self._parse_rule(
+                rule,
+                self.MATCH_TYPES,
+                "work-zone",
+            )
             if enabled:
-                normalized_rules.append((match_type, pattern.strip()))
+                normalized_rules.append((match_type, pattern, match_mode))
         if not normalized_rules:
             raise ValueError("A work-zone profile must have an enabled rule")
 
@@ -152,21 +152,15 @@ class WindowTracker:
         if enabled and not executable_path.strip():
             raise ValueError("Choose a work application before enabling the guard")
 
-        normalized_rules: list[tuple[str, str]] = []
+        normalized_rules: list[tuple[str, str, str]] = []
         for rule in blocked_rules:
-            if not isinstance(rule, tuple) or len(rule) != 3:
-                raise ValueError("Each focus-guard rule must have three values")
-            match_type, pattern, rule_enabled = rule
-            if (
-                not isinstance(match_type, str)
-                or match_type not in {"title", "process", "path", "accessible"}
-            ):
-                raise ValueError(f"Unsupported focus-guard match type: {match_type!r}")
-            self._validate_zone(pattern)
-            if not isinstance(rule_enabled, bool):
-                raise TypeError("Rule enabled flags must be bool values")
+            match_type, pattern, rule_enabled, match_mode = self._parse_rule(
+                rule,
+                frozenset({"title", "process", "path", "accessible"}),
+                "focus-guard",
+            )
             if rule_enabled:
-                normalized_rules.append((match_type, pattern.strip()))
+                normalized_rules.append((match_type, pattern, match_mode))
 
         with self._lock:
             self._focus_guard_enabled = enabled
@@ -208,9 +202,48 @@ class WindowTracker:
             os.path.abspath(second)
         )
 
+    @classmethod
+    def _parse_rule(
+        cls,
+        rule: tuple[object, ...],
+        allowed_types: frozenset[str],
+        label: str,
+    ) -> tuple[str, str, bool, str]:
+        if not isinstance(rule, tuple) or len(rule) not in (3, 4):
+            raise ValueError(f"Each {label} rule must have three or four values")
+        if len(rule) == 3:
+            match_type, pattern, enabled = rule
+            match_mode = "contains"
+        else:
+            match_type, pattern, enabled, match_mode = rule
+        if not isinstance(match_type, str) or match_type not in allowed_types:
+            raise ValueError(f"Unsupported {label} match type: {match_type!r}")
+        if not isinstance(pattern, str):
+            raise TypeError("Rule patterns must be strings")
+        cls._validate_zone(pattern)
+        if not isinstance(enabled, bool):
+            raise TypeError("Rule enabled flags must be bool values")
+        if not isinstance(match_mode, str) or match_mode not in cls.MATCH_MODES:
+            raise ValueError(f"Unsupported {label} match mode: {match_mode!r}")
+        return match_type, pattern.strip(), enabled, match_mode
+
     @staticmethod
+    def _value_matches(pattern: str, candidate: str, match_mode: str) -> bool:
+        fragment = unquote(pattern).replace("/", "\\").casefold()
+        normalized = unquote(candidate).replace("/", "\\").casefold()
+        if not fragment or not normalized:
+            return False
+        if match_mode == "token":
+            return re.search(
+                rf"(?<![\w]){re.escape(fragment)}(?![\w])",
+                normalized,
+            ) is not None
+        return fragment in normalized
+
+    @classmethod
     def _matches_work_zone_rules(
-        rules: Sequence[tuple[str, str]],
+        cls,
+        rules: Sequence[tuple[str, ...]],
         title: str,
         process_name: str = "",
         executable_path: str = "",
@@ -223,15 +256,35 @@ class WindowTracker:
             "accessible": accessible_values,
             "any": (title, process_name, executable_path, *accessible_values),
         }
-        for match_type, pattern in rules:
-            fragment = unquote(pattern).replace("/", "\\").casefold()
+        for rule in rules:
+            match_type = rule[0]
+            pattern = rule[1]
+            match_mode = rule[2] if len(rule) > 2 else "contains"
             if any(
-                fragment in unquote(value).replace("/", "\\").casefold()
+                cls._value_matches(pattern, value, match_mode)
                 for value in values_by_type[match_type]
                 if value
             ):
                 return True
         return False
+
+    def _cached_accessible_values(self, handle: int, title: str) -> tuple[str, ...]:
+        """Reuse a recent UI Automation read for the same foreground window."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._accessible_cache
+        if (
+            cached is not None
+            and cached[0] == handle
+            and cached[1] == title
+            and now - cached[2] < self.ACCESSIBLE_CACHE_SECONDS
+        ):
+            return cached[3]
+
+        values = self._get_accessible_window_values(handle)
+        with self._lock:
+            self._accessible_cache = (handle, title, now, values)
+        return values
 
     @staticmethod
     def _get_accessible_window_values(handle: int) -> tuple[str, ...]:
@@ -327,11 +380,11 @@ class WindowTracker:
         )
         needs_process_name = focus_guard_enabled or any(
             match_type in ("any", "process")
-            for match_type, _pattern in matching_rules
+            for match_type, _pattern, *_rest in matching_rules
         )
         needs_executable_path = focus_guard_enabled or any(
             match_type in ("any", "path")
-            for match_type, _pattern in matching_rules
+            for match_type, _pattern, *_rest in matching_rules
         )
         if needs_process_name or needs_executable_path:
             try:
@@ -343,16 +396,19 @@ class WindowTracker:
             except psutil.Error as error:
                 logger.warning("Could not inspect active process %s: %s", pid, error)
 
-        accessible_values = ()
+        accessible_values: tuple[str, ...] = ()
         if any(
             match_type == "accessible"
             or (
                 match_type == "any"
                 and self._needs_accessible_match(pattern)
             )
-            for match_type, pattern in matching_rules
+            for match_type, pattern, *_rest in matching_rules
         ):
-            accessible_values = self._get_accessible_window_values(window.getHandle())
+            accessible_values = self._cached_accessible_values(
+                window.getHandle(),
+                title,
+            )
 
         zone_matches = self._matches_work_zone_rules(
             work_zone_rules,

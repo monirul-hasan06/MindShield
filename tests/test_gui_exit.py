@@ -1,5 +1,6 @@
 import threading
 import unittest
+from datetime import datetime
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -11,6 +12,7 @@ class SaveWorkOnExitTests(unittest.TestCase):
         timer = Mock()
         timer.state = state
         timer.last_completed_work_sec = elapsed
+        timer.last_completed_work_started_at = datetime(2026, 6, 1, 9, 0, 0)
 
         def pause_work() -> None:
             timer.state = "paused"
@@ -35,7 +37,11 @@ class SaveWorkOnExitTests(unittest.TestCase):
         self.assertTrue(MainWindow._save_work_before_exit(window))
         self.assertTrue(MainWindow._save_work_before_exit(window))
 
-        window.database.log_work_segment.assert_called_once_with(37, "Writing")
+        window.database.log_work_segment.assert_called_once_with(
+            37,
+            "Writing",
+            datetime(2026, 6, 1, 9, 0, 0),
+        )
         self.assertEqual(window._pending_work_segments, [])
 
     def test_failed_exit_save_keeps_pending_work_for_retry(self) -> None:
@@ -45,9 +51,12 @@ class SaveWorkOnExitTests(unittest.TestCase):
             None,
         ]
 
-        with patch("src.gui.main_window.messagebox.showerror") as showerror:
+        with patch("src.gui.session_controller.messagebox.showerror") as showerror:
             self.assertFalse(MainWindow._save_work_before_exit(window))
-            self.assertEqual(window._pending_work_segments, [(37, "Writing")])
+            self.assertEqual(
+                window._pending_work_segments,
+                [(37, "Writing", datetime(2026, 6, 1, 9, 0, 0))],
+            )
             self.assertTrue(MainWindow._save_work_before_exit(window))
 
         self.assertEqual(window.database.log_work_segment.call_count, 2)

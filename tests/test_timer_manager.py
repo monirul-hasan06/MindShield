@@ -28,6 +28,7 @@ class TimerManagerTests(unittest.TestCase):
             time.sleep(0.05)
 
             self.assertGreater(completed_segment, 0)
+            self.assertIsNotNone(timer.last_completed_work_started_at)
             self.assertEqual(timer.current_work_elapsed_sec, 0)
             self.assertEqual(timer.last_completed_work_sec, completed_segment)
 

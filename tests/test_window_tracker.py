@@ -94,6 +94,56 @@ class WindowTrackerMatchingTests(unittest.TestCase):
             )
         )
 
+    def test_whole_token_mode_does_not_match_a_longer_word(self) -> None:
+        self.assertFalse(
+            WindowTracker._matches_work_zone_rules(
+                (("title", "code", "token"),),
+                "Encode notes",
+            )
+        )
+        self.assertTrue(
+            WindowTracker._matches_work_zone_rules(
+                (("title", "code", "token"),),
+                "Visual Studio Code - notes",
+            )
+        )
+        self.assertTrue(
+            WindowTracker._matches_work_zone_rules(
+                (("title", "code", "contains"),),
+                "Encode notes",
+            )
+        )
+
+    def test_accessible_values_are_reused_for_the_same_foreground_window(self) -> None:
+        class FakeWindow:
+            title = "Lesson - Browser"
+
+            def getPID(self) -> int:
+                return 44
+
+            def getHandle(self) -> int:
+                return 90
+
+        tracker = WindowTracker("Study")
+        tracker.set_work_zone_profile(
+            "Study",
+            [("accessible", "https://example.com/lesson", True)],
+        )
+        with (
+            patch("src.core.window_tracker.psutil.pid_exists", return_value=True),
+            patch("src.core.window_tracker.psutil.Process") as process_factory,
+            patch.object(
+                WindowTracker,
+                "_get_accessible_window_values",
+                return_value=("https://example.com/lesson",),
+            ) as read_accessible,
+        ):
+            tracker._inspect_window(FakeWindow())
+            tracker._inspect_window(FakeWindow())
+
+        self.assertEqual(read_accessible.call_count, 1)
+        process_factory.assert_not_called()
+
     def test_profile_accessible_rule_matches_browser_url_or_folder(self) -> None:
         self.assertTrue(
             WindowTracker._matches_work_zone_rules(

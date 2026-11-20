@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 import customtkinter as ctk
 
+from src.gui.monitor_bounds import foreground_monitor_bounds, overlay_geometry
 from src.gui.theme import COLORS
 from src.gui.themed_controls import themed_button
 
@@ -35,6 +36,7 @@ class OverlayWindow(ctk.CTkToplevel):
         on_pause: Callable[[], None] | None = None,
         on_return_to_work: Callable[[], None] | None = None,
         reduced_motion: bool = False,
+        monitor_bounds: tuple[int, int, int, int] | None = None,
     ) -> None:
         if isinstance(break_duration_sec, bool) or not isinstance(break_duration_sec, int):
             raise TypeError("break_duration_sec must be an integer")
@@ -64,15 +66,8 @@ class OverlayWindow(ctk.CTkToplevel):
         self.attributes("-alpha", 0.0)
         self.configure(fg_color=COLORS["overlay_background"])
 
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        if mode == "overlay":
-            width, height = screen_width, screen_height
-            x = y = 0
-        else:
-            width, height = min(420, screen_width), min(280, screen_height)
-            x = max(0, screen_width - width - 24)
-            y = max(0, screen_height - height - 48)
+        bounds = monitor_bounds or foreground_monitor_bounds()
+        x, y, width, height = overlay_geometry(mode, bounds)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
         content = ctk.CTkFrame(self, fg_color="transparent")

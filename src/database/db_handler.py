@@ -22,12 +22,13 @@ import win32crypt
 
 @dataclass(frozen=True)
 class WorkZoneRule:
-    """A persisted substring rule used to match an active window."""
+    """A persisted rule used to match an active window."""
 
     id: int
     match_type: str
     pattern: str
     enabled: bool
+    match_mode: str = "contains"
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,13 @@ class SessionRecord:
 
     date: str
     start_time: str
-    duration_minutes: int
+    duration_seconds: int
     work_zone: str
+
+    @property
+    def duration_minutes(self) -> int:
+        """Whole minutes rounded from the exact recorded duration."""
+        return int(round(self.duration_seconds / 60))
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,7 @@ class FocusGuardRule:
     match_type: str
     pattern: str
     enabled: bool
+    match_mode: str = "contains"
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,13 @@ class DatabaseHandler:
     )
     FOCUS_GUARD_MATCH_TYPES = frozenset(
         {"title", "process", "path", "accessible"}
+    )
+    MATCH_MODES = frozenset({"contains", "token"})
+    SCHEMA_VERSION = 3
+    MAX_BACKUP_DATABASE_BYTES = 512 * 1024 * 1024
+    EFFECTIVE_WORK_SECONDS_SQL = (
+        "CASE WHEN COALESCE(duration_seconds, 0) > 0 "
+        "THEN duration_seconds ELSE COALESCE(duration_minutes, 0) * 60 END"
     )
 
     def __init__(
@@ -296,8 +310,14 @@ class DatabaseHandler:
                 ):
                     raise ValueError("The selected file is not a valid MindShield backup")
                 key_info = archive.getinfo("database.key.dpapi")
+                database_info = archive.getinfo("mindshield.db")
                 if key_info.file_size > 4096:
                     raise ValueError("The protected database key in the backup is invalid")
+                if (
+                    database_info.file_size <= 0
+                    or database_info.file_size > self.MAX_BACKUP_DATABASE_BYTES
+                ):
+                    raise ValueError("The backup database is too large to restore")
                 protected_key = archive.read(key_info)
                 restored_key = self._unprotect_key(protected_key)
 
@@ -375,99 +395,167 @@ class DatabaseHandler:
             ) from error
 
     def init_db(self) -> None:
-        """Create the database schema, migrating the former work-zone column."""
+        """Create or migrate the encrypted schema up to :attr:`SCHEMA_VERSION`."""
         with closing(self._connect()) as connection, connection:
+            version = self._current_schema_version(connection)
+            if version < 1:
+                self._migrate_to_v1(connection)
+                self._store_schema_version(connection, 1)
+            if version < 2:
+                self._migrate_to_v2(connection)
+                self._store_schema_version(connection, 2)
+            if version < 3:
+                self._migrate_to_v3(connection)
+                self._store_schema_version(connection, 3)
+
+    @staticmethod
+    def _current_schema_version(connection: sqlite3.Connection) -> int:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY
+            )
+            """
+        )
+        row = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
+    @staticmethod
+    def _store_schema_version(connection: sqlite3.Connection, version: int) -> None:
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+            (version,),
+        )
+
+    def _migrate_to_v1(self, connection: sqlite3.Connection) -> None:
+        """Create the original tables and one-time column renames."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS work_logs (
+                id INTEGER PRIMARY KEY,
+                date TEXT,
+                start_time TEXT,
+                duration_minutes INTEGER,
+                work_zone TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT UNIQUE,
+                value TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS break_logs (
+                id INTEGER PRIMARY KEY,
+                date TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                work_zone TEXT NOT NULL,
+                completed_at TEXT,
+                break_type TEXT NOT NULL DEFAULT 'scheduled'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS focus_guard_rules (
+                id INTEGER PRIMARY KEY,
+                match_type TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS work_zone_profiles (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS work_zone_rules (
+                id INTEGER PRIMARY KEY,
+                profile_id INTEGER NOT NULL
+                    REFERENCES work_zone_profiles(id) ON DELETE CASCADE,
+                match_type TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+            )
+            """
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(work_logs)")
+        }
+        if "work_zone_title" in columns and "work_zone" not in columns:
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS work_logs (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT,
-                    start_time TEXT,
-                    duration_minutes INTEGER,
-                    work_zone TEXT
-                )
-                """
+                "ALTER TABLE work_logs RENAME COLUMN work_zone_title TO work_zone"
+            )
+            columns.remove("work_zone_title")
+            columns.add("work_zone")
+        if "duration_seconds" not in columns:
+            connection.execute(
+                "ALTER TABLE work_logs "
+                "ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0"
             )
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT UNIQUE,
-                    value TEXT
-                )
-                """
+                "UPDATE work_logs SET duration_seconds = "
+                "COALESCE(duration_minutes, 0) * 60"
             )
+        break_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(break_logs)")
+        }
+        if "break_type" not in break_columns:
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS break_logs (
-                    id INTEGER PRIMARY KEY,
-                    date TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    duration_seconds INTEGER NOT NULL,
-                    work_zone TEXT NOT NULL,
-                    completed_at TEXT,
-                    break_type TEXT NOT NULL DEFAULT 'scheduled'
-                )
-                """
+                "ALTER TABLE break_logs "
+                "ADD COLUMN break_type TEXT NOT NULL DEFAULT 'scheduled'"
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS focus_guard_rules (
-                    id INTEGER PRIMARY KEY,
-                    match_type TEXT NOT NULL,
-                    pattern TEXT NOT NULL,
-                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS work_zone_profiles (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS work_zone_rules (
-                    id INTEGER PRIMARY KEY,
-                    profile_id INTEGER NOT NULL
-                        REFERENCES work_zone_profiles(id) ON DELETE CASCADE,
-                    match_type TEXT NOT NULL,
-                    pattern TEXT NOT NULL,
-                    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
-                )
-                """
-            )
+        self._migrate_work_zone_profiles(connection)
+
+    @staticmethod
+    def _migrate_to_v2(connection: sqlite3.Connection) -> None:
+        """Index activity dates and backfill exact durations for older rows."""
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_work_logs_date ON work_logs(date)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_break_logs_date ON break_logs(date)"
+        )
+        connection.execute(
+            """
+            UPDATE work_logs
+            SET duration_seconds = COALESCE(duration_minutes, 0) * 60
+            WHERE COALESCE(duration_seconds, 0) = 0
+                AND COALESCE(duration_minutes, 0) > 0
+            """
+        )
+
+    @staticmethod
+    def _migrate_to_v3(connection: sqlite3.Connection) -> None:
+        """Record whether each rule is a substring or a whole-token match."""
+        for table in ("work_zone_rules", "focus_guard_rules"):
             columns = {
                 row["name"]
-                for row in connection.execute("PRAGMA table_info(work_logs)")
+                for row in connection.execute(f"PRAGMA table_info({table})")
             }
-            if "work_zone_title" in columns and "work_zone" not in columns:
+            if "match_mode" not in columns:
                 connection.execute(
-                    "ALTER TABLE work_logs RENAME COLUMN work_zone_title TO work_zone"
+                    f"ALTER TABLE {table} ADD COLUMN match_mode "
+                    "TEXT NOT NULL DEFAULT 'contains'"
                 )
-                columns.remove("work_zone_title")
-                columns.add("work_zone")
-            if "duration_seconds" not in columns:
-                connection.execute(
-                    "ALTER TABLE work_logs "
-                    "ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0"
-                )
-                connection.execute(
-                    "UPDATE work_logs SET duration_seconds = "
-                    "COALESCE(duration_minutes, 0) * 60"
-                )
-            break_columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(break_logs)")
-            }
-            if "break_type" not in break_columns:
-                connection.execute(
-                    "ALTER TABLE break_logs "
-                    "ADD COLUMN break_type TEXT NOT NULL DEFAULT 'scheduled'"
-                )
-            self._migrate_work_zone_profiles(connection)
 
     def _migrate_work_zone_profiles(
         self,
@@ -635,14 +723,14 @@ class DatabaseHandler:
         today = date.today().isoformat()
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
-                """
-                SELECT COALESCE(SUM(duration_minutes), 0)
+                f"""
+                SELECT COALESCE(SUM({self.EFFECTIVE_WORK_SECONDS_SQL}), 0)
                 FROM work_logs
                 WHERE date BETWEEN ? AND ?
                 """,
                 (month_start, today),
             ).fetchone()
-            return int(row[0])
+            return int(round(int(row[0]) / 60))
 
     def get_setting(self, key: str) -> str | None:
         """Return a saved preference, or ``None`` when it has not been set."""
@@ -691,7 +779,7 @@ class DatabaseHandler:
             ).fetchall()
             rule_rows = connection.execute(
                 """
-                SELECT id, profile_id, match_type, pattern, enabled
+                SELECT id, profile_id, match_type, pattern, enabled, match_mode
                 FROM work_zone_rules
                 ORDER BY profile_id, id
                 """
@@ -706,6 +794,7 @@ class DatabaseHandler:
                     match_type=str(row["match_type"]),
                     pattern=str(row["pattern"]),
                     enabled=bool(row["enabled"]),
+                    match_mode=str(row["match_mode"] or "contains"),
                 )
             )
         return [
@@ -716,6 +805,38 @@ class DatabaseHandler:
             )
             for row in profile_rows
         ]
+
+    @staticmethod
+    def _normalize_rules(
+        rules: Sequence[tuple[object, ...]],
+        allowed_types: frozenset[str],
+        label: str,
+    ) -> list[tuple[str, str, int, str]]:
+        """Validate rule tuples, defaulting omitted modes to substring contains."""
+        normalized: list[tuple[str, str, int, str]] = []
+        for rule in rules:
+            if not isinstance(rule, tuple) or len(rule) not in (3, 4):
+                raise ValueError(
+                    "Each rule must contain a type, pattern, and enabled flag"
+                )
+            if len(rule) == 3:
+                match_type, pattern, enabled = rule
+                match_mode = "contains"
+            else:
+                match_type, pattern, enabled, match_mode = rule
+            if not isinstance(match_type, str) or match_type not in allowed_types:
+                raise ValueError(f"Unsupported {label} match type: {match_type!r}")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError(f"{label.capitalize()} patterns must not be empty")
+            if not isinstance(enabled, bool):
+                raise TypeError("Rule enabled flags must be bool values")
+            if (
+                not isinstance(match_mode, str)
+                or match_mode not in DatabaseHandler.MATCH_MODES
+            ):
+                raise ValueError(f"Unsupported {label} match mode: {match_mode!r}")
+            normalized.append((match_type, pattern.strip(), int(enabled), match_mode))
+        return normalized
 
     def get_active_work_zone_profile(self) -> WorkZoneProfile:
         """Return the active work-zone profile, falling back to the first one."""
@@ -744,19 +865,12 @@ class DatabaseHandler:
             raise ValueError("Profile name must be a non-empty string")
         if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
             raise TypeError("rules must be a sequence of rule tuples")
-        normalized_rules: list[tuple[str, str, int]] = []
-        for rule in rules:
-            if not isinstance(rule, tuple) or len(rule) != 3:
-                raise ValueError("Each rule must contain a type, pattern, and enabled flag")
-            match_type, pattern, enabled = rule
-            if match_type not in self.WORK_ZONE_MATCH_TYPES:
-                raise ValueError(f"Unsupported work-zone match type: {match_type!r}")
-            if not isinstance(pattern, str) or not pattern.strip():
-                raise ValueError("Work-zone match patterns must not be empty")
-            if not isinstance(enabled, bool):
-                raise TypeError("Rule enabled flags must be bool values")
-            normalized_rules.append((match_type, pattern.strip(), int(enabled)))
-        if not any(enabled for _, _, enabled in normalized_rules):
+        normalized_rules = self._normalize_rules(
+            rules,
+            self.WORK_ZONE_MATCH_TYPES,
+            "work-zone",
+        )
+        if not any(enabled for _, _, enabled, _mode in normalized_rules):
             raise ValueError("Enable at least one work-zone rule")
         if profile_id is not None and (
             isinstance(profile_id, bool)
@@ -789,12 +903,12 @@ class DatabaseHandler:
             connection.executemany(
                 """
                 INSERT INTO work_zone_rules
-                    (profile_id, match_type, pattern, enabled)
-                VALUES (?, ?, ?, ?)
+                    (profile_id, match_type, pattern, enabled, match_mode)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 [
-                    (profile_id, match_type, pattern, enabled)
-                    for match_type, pattern, enabled in normalized_rules
+                    (profile_id, match_type, pattern, enabled, match_mode)
+                    for match_type, pattern, enabled, match_mode in normalized_rules
                 ],
             )
             active_profile_id = connection.execute(
@@ -893,7 +1007,9 @@ class DatabaseHandler:
         with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 f"""
-                SELECT date, start_time, duration_minutes, work_zone
+                SELECT date, start_time,
+                    {self.EFFECTIVE_WORK_SECONDS_SQL} AS duration_seconds,
+                    work_zone
                 FROM work_logs
                 {where_clause}
                 ORDER BY date DESC, start_time DESC, id DESC
@@ -904,7 +1020,7 @@ class DatabaseHandler:
             SessionRecord(
                 date=str(row["date"] or ""),
                 start_time=str(row["start_time"] or ""),
-                duration_minutes=int(row["duration_minutes"] or 0),
+                duration_seconds=int(row["duration_seconds"] or 0),
                 work_zone=str(row["work_zone"] or ""),
             )
             for row in rows
@@ -921,12 +1037,12 @@ class DatabaseHandler:
         records = self.get_session_history(start_date, end_date, search)
         with Path(file_path).open("w", encoding="utf-8-sig", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(("Date", "Start time", "Duration (minutes)", "Work zone"))
+            writer.writerow(("Date", "Start time", "Duration (seconds)", "Work zone"))
             writer.writerows(
                 (
                     record.date,
                     record.start_time,
-                    record.duration_minutes,
+                    record.duration_seconds,
                     record.work_zone,
                 )
                 for record in records
@@ -944,24 +1060,14 @@ class DatabaseHandler:
         if not isinstance(work_zone, str) or not work_zone.strip():
             raise ValueError("work_zone must be a non-empty string")
 
-        now = datetime.now()
-        with closing(self._connect()) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO work_logs
-                    (date, start_time, duration_minutes, work_zone, duration_seconds)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    now.date().isoformat(),
-                    now.time().isoformat(timespec="seconds"),
-                    duration_mins,
-                    work_zone.strip(),
-                    duration_mins * 60,
-                ),
-            )
+        self.log_work_segment(duration_mins * 60, work_zone)
 
-    def log_work_segment(self, duration_seconds: int, work_zone: str) -> None:
+    def log_work_segment(
+        self,
+        duration_seconds: int,
+        work_zone: str,
+        started_at: datetime | None = None,
+    ) -> None:
         """Store an active work segment with second-level duration."""
         if (
             isinstance(duration_seconds, bool)
@@ -972,7 +1078,10 @@ class DatabaseHandler:
         if not isinstance(work_zone, str) or not work_zone.strip():
             raise ValueError("work_zone must be a non-empty string")
 
-        now = datetime.now()
+        if started_at is None:
+            started_at = datetime.now() - timedelta(seconds=duration_seconds)
+        elif not isinstance(started_at, datetime):
+            raise TypeError("started_at must be a datetime")
         duration_minutes = int(round(duration_seconds / 60))
         with closing(self._connect()) as connection, connection:
             connection.execute(
@@ -982,8 +1091,8 @@ class DatabaseHandler:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    now.date().isoformat(),
-                    now.time().isoformat(timespec="seconds"),
+                    started_at.date().isoformat(),
+                    started_at.time().isoformat(timespec="seconds"),
                     duration_minutes,
                     work_zone.strip(),
                     duration_seconds,
@@ -995,7 +1104,7 @@ class DatabaseHandler:
         with closing(self._connect()) as connection, connection:
             rows = connection.execute(
                 """
-                SELECT id, match_type, pattern, enabled
+                SELECT id, match_type, pattern, enabled, match_mode
                 FROM focus_guard_rules
                 ORDER BY id
                 """
@@ -1006,6 +1115,7 @@ class DatabaseHandler:
                 match_type=str(row["match_type"]),
                 pattern=str(row["pattern"]),
                 enabled=bool(row["enabled"]),
+                match_mode=str(row["match_mode"] or "contains"),
             )
             for row in rows
         ]
@@ -1017,28 +1127,19 @@ class DatabaseHandler:
         """Replace blocked-app/site rules after validating their types and values."""
         if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
             raise TypeError("rules must be a sequence of rule tuples")
-        normalized_rules: list[tuple[str, str, int]] = []
-        for rule in rules:
-            if not isinstance(rule, tuple) or len(rule) != 3:
-                raise ValueError("Each rule must contain a type, pattern, and enabled flag")
-            match_type, pattern, enabled = rule
-            if (
-                not isinstance(match_type, str)
-                or match_type not in self.FOCUS_GUARD_MATCH_TYPES
-            ):
-                raise ValueError(f"Unsupported focus-guard match type: {match_type!r}")
-            if not isinstance(pattern, str) or not pattern.strip():
-                raise ValueError("Focus-guard patterns must not be empty")
-            if not isinstance(enabled, bool):
-                raise TypeError("Rule enabled flags must be bool values")
-            normalized_rules.append((match_type, pattern.strip(), int(enabled)))
+        normalized_rules = self._normalize_rules(
+            rules,
+            self.FOCUS_GUARD_MATCH_TYPES,
+            "focus-guard",
+        )
 
         with closing(self._connect()) as connection, connection:
             connection.execute("DELETE FROM focus_guard_rules")
             connection.executemany(
                 """
-                INSERT INTO focus_guard_rules (match_type, pattern, enabled)
-                VALUES (?, ?, ?)
+                INSERT INTO focus_guard_rules
+                    (match_type, pattern, enabled, match_mode)
+                VALUES (?, ?, ?, ?)
                 """,
                 normalized_rules,
             )
@@ -1079,7 +1180,7 @@ class DatabaseHandler:
         with closing(self._connect()) as connection, connection:
             work_row = connection.execute(
                 f"""
-                SELECT COALESCE(SUM(duration_seconds), 0)
+                SELECT COALESCE(SUM({self.EFFECTIVE_WORK_SECONDS_SQL}), 0)
                 FROM work_logs
                 {work_where}
                 """,
@@ -1117,24 +1218,52 @@ class DatabaseHandler:
                     (preserve_break_id,),
                 )
 
-    def get_todays_total_minutes(self) -> int:
-        """Return the total logged work minutes for the current local date."""
+    def get_focus_seconds(
+        self,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> int:
+        """Return exact recorded work seconds for an inclusive date range."""
+        for value in (start_date, end_date):
+            if value is not None and (
+                not isinstance(value, date) or isinstance(value, datetime)
+            ):
+                raise TypeError("focus dates must be date values")
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError("start_date must not be after end_date")
+
+        conditions: list[str] = []
+        parameters: list[str] = []
+        if start_date is not None:
+            conditions.append("date >= ?")
+            parameters.append(start_date.isoformat())
+        if end_date is not None:
+            conditions.append("date <= ?")
+            parameters.append(end_date.isoformat())
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
-                "SELECT COALESCE(SUM(duration_minutes), 0) "
-                "FROM work_logs WHERE date = ?",
-                (date.today().isoformat(),),
+                f"""
+                SELECT COALESCE(SUM({self.EFFECTIVE_WORK_SECONDS_SQL}), 0)
+                FROM work_logs
+                {where_clause}
+                """,
+                parameters,
             ).fetchone()
             return int(row[0])
 
+    def get_todays_total_minutes(self) -> int:
+        """Return the total logged work minutes for the current local date."""
+        return int(round(self.get_focus_seconds(date.today(), date.today()) / 60))
+
     def get_weekly_logs(self) -> list[tuple[str, int]]:
-        """Return daily focus totals for each of the past seven calendar days."""
+        """Return daily focus totals in seconds for each of the past seven days."""
         today = date.today()
         first_day = today - timedelta(days=6)
         with closing(self._connect()) as connection, connection:
             rows = connection.execute(
-                """
-                SELECT date, SUM(duration_minutes) AS total_minutes
+                f"""
+                SELECT date, SUM({self.EFFECTIVE_WORK_SECONDS_SQL}) AS total_seconds
                 FROM work_logs
                 WHERE date BETWEEN ? AND ?
                 GROUP BY date
@@ -1143,7 +1272,7 @@ class DatabaseHandler:
                 (first_day.isoformat(), today.isoformat()),
             ).fetchall()
             totals_by_date = {
-                row["date"]: int(row["total_minutes"])
+                row["date"]: int(row["total_seconds"])
                 for row in rows
             }
 
@@ -1209,8 +1338,13 @@ class DatabaseHandler:
 
             connection.executemany(
                 """
-                INSERT INTO work_logs (date, start_time, duration_minutes, work_zone)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO work_logs (
+                    date, start_time, duration_minutes, work_zone, duration_seconds
+                )
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                demo_rows,
+                [
+                    (log_date, start_time, duration, zone, duration * 60)
+                    for log_date, start_time, duration, zone in demo_rows
+                ],
             )

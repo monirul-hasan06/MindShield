@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zipfile import ZipFile
@@ -348,8 +348,8 @@ class DatabaseHandlerSettingsTests(unittest.TestCase):
             self.assertEqual(
                 rows,
                 [
-                    ["Date", "Start time", "Duration (minutes)", "Work zone"],
-                    [today.isoformat(), "09:15:00", "25", "Study"],
+                    ["Date", "Start time", "Duration (seconds)", "Work zone"],
+                    [today.isoformat(), "09:15:00", "1500", "Study"],
                 ],
             )
 
@@ -396,6 +396,53 @@ class DatabaseHandlerSettingsTests(unittest.TestCase):
                 database.restore_from(backup_path)
 
             self.assertEqual(database.get_setting("active_work_zone"), "Study")
+
+    def test_short_segments_keep_exact_seconds_and_start_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = DatabaseHandler(Path(temp_dir) / "mindshield.db")
+            started = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
+            database.log_work_segment(29, "Study", started)
+            database.log_work_segment(29, "Study", started)
+
+            today = date.today()
+            self.assertEqual(database.get_focus_seconds(today, today), 58)
+            self.assertEqual(database.get_todays_total_minutes(), 1)
+            history = database.get_session_history()
+            self.assertEqual(history[0].start_time, "09:15:00")
+            self.assertEqual(history[0].duration_seconds, 29)
+
+    def test_schema_is_versioned_and_activity_dates_are_indexed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = DatabaseHandler(Path(temp_dir) / "mindshield.db")
+            with closing(database._connect()) as connection:
+                version = connection.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0]
+                index_names = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index'"
+                    )
+                }
+
+            self.assertEqual(version, DatabaseHandler.SCHEMA_VERSION)
+            self.assertIn("idx_work_logs_date", index_names)
+            self.assertIn("idx_break_logs_date", index_names)
+
+    def test_oversized_backup_database_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = DatabaseHandler(Path(temp_dir) / "mindshield.db")
+            backup_path = Path(temp_dir) / "mindshield.msbackup"
+            database.set_settings({"user_name": "Monirul"})
+            database.backup_to(backup_path)
+
+            with (
+                patch.object(DatabaseHandler, "MAX_BACKUP_DATABASE_BYTES", 8),
+                self.assertRaises(ValueError),
+            ):
+                database.restore_from(backup_path)
+
+            self.assertEqual(database.get_setting("user_name"), "Monirul")
 
 
 if __name__ == "__main__":
